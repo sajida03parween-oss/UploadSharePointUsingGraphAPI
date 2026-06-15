@@ -151,65 +151,58 @@ def process(node, sp, parent):
             return
 
         # =================================================
-        # Upload Name + Path Logic
-        #
-        # SmarTeam now PRECOMPUTES the upload filename and the
-        # previous-revision decision. GraphAPI reads "UploadPath"
-        # (project-relative, e.g. "<Project>/<folder>/.../<file>")
-        # and reuses ITS TAIL — the final filename and the
-        # previous_revision flag — instead of recomputing CAD-ref
-        # vs FILE_NAME and the revision branch on the fly.
-        #
-        # The folder is still anchored on GraphAPI's own `parent`
-        # base (GraphAPI/<project tree>) so the two path bases stay
-        # consistent regardless of how SmarTeam names its root.
-        #
-        # Falls back to the legacy computation when UploadPath is
-        # absent (older CSV/JSON files still work).
+        # Upload Name Logic
         # =================================================
 
-        original_name = node.get("FILE_NAME")
-        cad_ref_name = node.get("CAD_REF_FILE_NAME")
-        precomputed_upload = (node.get("UploadPath") or "").strip()
+        original_name = (
+            node.get("FILE_NAME")
+        )
 
-        if precomputed_upload:
+        cad_ref_name = (
+            node.get("CAD_REF_FILE_NAME")
+        )
 
-            # ---- BLIND PATH: trust SmarTeam's computation ----
-            normalized = precomputed_upload.replace("\\", "/")
+        json_path = (
+            node.get("Path", "")
+        ).lower()
 
-            # Final upload filename = last path segment
-            upload_name = normalized.rsplit("/", 1)[-1]
+        is_previous_revision = (
+            "previous_revision"
+            in json_path
+        )
 
-            # Previous-revision decision = presence of the marker folder
-            is_previous_revision = (
-                "/previous_revision/" in normalized.lower()
-            )
+        # =============================================
+        # Previous Revision
+        # Keep original filename
+        # =============================================
 
-            log("\n🚀 Upload Details (from SmarTeam UploadPath)")
-            log("UploadPath:", precomputed_upload)
-            log("Final Upload Name:", upload_name)
+        if is_previous_revision:
+
+            upload_name = original_name
+
+        # =============================================
+        # Normal files
+        # Use CAD_REF_FILE_NAME
+        # =============================================
 
         else:
 
-            # ---- FALLBACK: legacy on-the-fly computation ----
-            json_path = (node.get("Path", "") or "").lower()
-
-            is_previous_revision = (
-                "previous_revision" in json_path
+            upload_name = (
+                cad_ref_name
+                or original_name
             )
 
-            if is_previous_revision:
-                upload_name = original_name
-            else:
-                upload_name = cad_ref_name or original_name
-
-            log("\n🚀 Upload Details (computed)")
-            log("Original Name:", original_name)
-            log("CAD Ref Name:", cad_ref_name)
-            log("Final Upload Name:", upload_name)
+        log("\n🚀 Upload Details")
+        log("Original Name:", original_name)
+        log("CAD Ref Name:", cad_ref_name)
+        log("Final Upload Name:", upload_name)
 
         # =================================================
-        # Target Folder (anchored on GraphAPI parent base)
+        # Upload Path
+        # =================================================
+
+        # =================================================
+        # Previous Revision Folder
         # =================================================
 
         target_folder = parent
