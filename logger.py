@@ -1,4 +1,5 @@
 import os
+import csv
 import atexit
 import threading
 from datetime import datetime
@@ -26,6 +27,8 @@ _lines_in_current_file = 0     # How many lines already written to it
 
 _processed_count = 0           # Global "files processed" counter
 
+_current_project_id = None     # Project id stem (e.g. "3476") for filenames
+
 
 # =========================================================
 # Filename helpers
@@ -33,14 +36,20 @@ _processed_count = 0           # Global "files processed" counter
 
 def _new_log_filename():
     """
-    Build a fresh log filename of the form log_<YYYY-MM-DD_HH-MM-SS>.txt
-    in LOG_DIR. If a file with that name already exists (e.g. a fast
-    rotation within the same second), suffix with _part2, _part3, ...
+    Build a fresh log filename of the form
+        log_<YYYYMMDD_HHMMSS>[_<projectId>].log
+    in LOG_DIR. When a project id is active, it is appended so each
+    project's log is identifiable (e.g. log_20260616_143052_3476.log).
+    If a file with that name already exists (fast rotation within the
+    same second), suffix with _part2, _part3, ...
     """
 
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    base_name = f"{LOG_FILE_PREFIX}_{ts}.txt"
+    if _current_project_id:
+        base_name = f"{LOG_FILE_PREFIX}_{ts}_{_current_project_id}.log"
+    else:
+        base_name = f"{LOG_FILE_PREFIX}_{ts}.log"
 
     base_path = (
         os.path.join(LOG_DIR, base_name)
@@ -53,7 +62,7 @@ def _new_log_filename():
     # Collision — append a counter
     i = 2
     while True:
-        alt = base_path[:-4] + f"_part{i}.txt"
+        alt = base_path[:-4] + f"_part{i}.log"
         if not os.path.exists(alt):
             return alt
         i += 1
@@ -208,6 +217,238 @@ def log_session_start():
     log("NEW SESSION STARTED")
     log(banner)
     flush_logs()
+
+
+# =========================================================
+# Per-project context
+# =========================================================
+
+def start_project(project_id):
+    """
+    Begin a new project. Flushes the current log, then starts a FRESH
+    log file named log_<YYYYMMDD_HHMMSS>_<project_id>.log so each
+    project gets its own log. Also sets the active project id used by
+    builder.py to name failed_<id>.csv and processed_<id>.csv.
+    """
+    global _current_project_id, _current_log_file, _lines_in_current_file
+
+    with _lock:
+        # Flush anything pending into the OLD log file first
+        _flush_locked()
+        # Switch project + force a brand-new log file on next write
+        _current_project_id = str(project_id) if project_id is not None else None
+        _current_log_file = None
+        _lines_in_current_file = 0
+
+    banner = "=" * 60
+    log(banner)
+    log(f"PROJECT START: {project_id}")
+    log(banner)
+    flush_logs()
+
+
+def get_project_id():
+    """Return the active project id stem (or None)."""
+    return _current_project_id
+
+
+# =========================================================
+# Per-project FAILED-files CSV
+#
+# One file per project: failed_<projectId>.csv
+# Captures every failure point (metadata, upload, chunk, folder
+# create/fetch, vault-missing, naming, etc.) with identifying
+# info and the reason.
+# =========================================================
+
+FAILED_PREFIX = "failed"
+
+_FAILED_HEADER = [
+    "ProjectId",
+    "Stage",            # where it failed: FOLDER_CREATE, UPLOAD, CHUNK, METADATA, VAULT, NAMING, ...
+    "TDMX_ID",
+    "OBJECT_ID",
+    "Description",
+    "NodeType",         # FILE / FOLDER / PROJECT / UNKNOWN
+    "Path",
+    "UploadPath",
+    "Reason",
+]
+
+
+def _failed_csv_path():
+    pid = _current_project_id or "unknown"
+    name = f"{FAILED_PREFIX}_{pid}.csv"
+    return os.path.join(LOG_DIR, name) if LOG_DIR else name
+
+
+def _node_object_id(node):
+    # Support several possible id keys seen across project/document JSON
+    return (
+        node.get("OBJECT_ID")
+        or node.get("DocObjectId")
+        or node.get("ObjectId")
+        or node.get("VAULT_OBJECT_ID")
+        or ""
+    )
+
+
+def _node_tdmx_id(node):
+    return node.get("TDMX_ID") or node.get("TdmxId") or ""
+
+
+def log_failed(node, stage, reason, node_type="", upload_path=""):
+    """
+    Append a failure record to failed_<projectId>.csv.
+
+    node       : the JSON node dict (file/folder/project) — may be {} if unknown
+    stage      : short stage tag, e.g. "UPLOAD", "FOLDER_CREATE", "METADATA"
+    reason     : human-readable error / exception text
+    node_type  : FILE / FOLDER / PROJECT (optional)
+    upload_path: target SharePoint path if known (optional)
+    """
+    node = node or {}
+    path = _failed_csv_path()
+    write_header = not os.path.exists(path)
+
+    row = [
+        _current_project_id or "",
+        stage,
+        _node_tdmx_id(node),
+        _node_object_id(node),
+        node.get("Description") or node.get("TDM_DESCRIPTION") or "",
+        node_type,
+        node.get("Path", ""),
+        upload_path or node.get("UploadPath", ""),
+        reason,
+    ]
+
+    try:
+        if LOG_DIR and LOG_DIR not in (".", ""):
+            os.makedirs(LOG_DIR, exist_ok=True)
+        with open(path, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(_FAILED_HEADER)
+            w.writerow(row)
+    except Exception as e:
+        # Never let failure-logging crash the run
+        log(f"⚠️ Could not write failed record: {e}")
+
+
+# =========================================================
+# Per-project PROCESSED CSV
+#
+# One file per project: processed_<projectId>.csv
+# Records EVERY node processed (project / folder / file) with the
+# fields present in the JSON plus the SharePoint path and a
+# Success/Failure status. Replaces the old processed_files.txt.
+# =========================================================
+
+PROCESSED_PREFIX = "processed"
+
+_PROCESSED_HEADER = [
+    "ProjectId",
+    "NodeType",         # PROJECT / FOLDER / FILE
+    "OBJECT_ID",
+    "TDMX_ID",
+    "Reference",        # PROJECT: CN_REFERENCE_PROJECT | FOLDER/FILE: TDMX_CAD_IDENTIFIER
+    "CADRefFileName",   # FILE: CAD_REF_FILE_NAME | empty for PROJECT/FOLDER
+    "Description",      # TDMX description / Description
+    "FILE_NAME",
+    "FileExtension",    # e.g. .pdf / .CATDrawing (blank for folders/projects)
+    "FILE_SIZE",        # raw bytes from Documents_Tree (blank for folders)
+    "FILE_SIZE_DISPLAY",# human-readable size from Documents_Tree
+    "REVISION",
+    "Path",             # source/tree path from JSON
+    "SharePointPath",   # where it was created/uploaded
+    "Status",           # Success / Failure / Skipped(...)
+    "Detail",           # optional extra note (reason, "duplicate", etc.)
+    "ExtractTimestamp", # when SmarTeam extracted the doc (carried from JSON)
+    "UploadTimestamp",  # when GraphAPI processed/uploaded this row (local time)
+]
+
+
+def _processed_csv_path():
+    pid = _current_project_id or "unknown"
+    name = f"{PROCESSED_PREFIX}_{pid}.csv"
+    return os.path.join(LOG_DIR, name) if LOG_DIR else name
+
+
+def log_processed(node, node_type, status, sharepoint_path="", detail=""):
+    """
+    Append a processed-node record to processed_<projectId>.csv.
+
+    node           : the JSON node dict
+    node_type      : PROJECT / FOLDER / FILE
+    status         : "Success" / "Failure" / "Skipped(...)" etc.
+    sharepoint_path: created folder path or uploaded file path
+    detail         : optional extra note
+
+    Two timestamps are recorded:
+      - ExtractTimestamp: taken from the node (set by SmarTeam at extract)
+      - UploadTimestamp : now (when GraphAPI handled this row)
+    """
+    node = node or {}
+    path = _processed_csv_path()
+    write_header = not os.path.exists(path)
+
+    upload_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Reference column by node type:
+    #   PROJECT      -> CN_REFERENCE_PROJECT
+    #   FOLDER/FILE  -> TDMX_CAD_IDENTIFIER
+    nt = (node_type or "").upper()
+    if nt == "PROJECT":
+        reference = node.get("CN_REFERENCE_PROJECT", "") or ""
+    else:  # FOLDER or FILE
+        reference = node.get("TDMX_CAD_IDENTIFIER", "") or ""
+
+    # CADRefFileName column: only for FILE (documents); empty otherwise
+    if nt == "FILE":
+        cad_ref_file_name = node.get("CAD_REF_FILE_NAME", "") or ""
+    else:
+        cad_ref_file_name = ""
+
+    # File extension (only meaningful for files), e.g. ".pdf" / ".CATDrawing"
+    file_name = node.get("FILE_NAME", "") or ""
+    file_ext = os.path.splitext(file_name)[1] if file_name else ""
+
+    row = [
+        _current_project_id or "",
+        node_type,
+        _node_object_id(node),
+        _node_tdmx_id(node),
+        reference,
+        cad_ref_file_name,
+        node.get("Description")
+            or node.get("TDM_DESCRIPTION")
+            or node.get("TDMX_DESCRIPTION")
+            or "",
+        file_name,
+        file_ext,
+        node.get("FILE_SIZE", ""),
+        node.get("FILE_SIZE_DISPLAY", ""),
+        node.get("REVISION", ""),
+        node.get("Path", ""),
+        sharepoint_path,
+        status,
+        detail,
+        node.get("ExtractTimestamp", ""),
+        upload_ts,
+    ]
+
+    try:
+        if LOG_DIR and LOG_DIR not in (".", ""):
+            os.makedirs(LOG_DIR, exist_ok=True)
+        with open(path, "a", newline="", encoding="utf-8-sig") as f:
+            # Semicolon-separated (instead of comma) per requirement
+            w = csv.writer(f, delimiter=";")
+            if write_header:
+                w.writerow(_PROCESSED_HEADER)
+            w.writerow(row)
+    except Exception as e:
+        log(f"⚠️ Could not write processed record: {e}")
 
 
 # =========================================================

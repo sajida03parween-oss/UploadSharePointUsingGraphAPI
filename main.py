@@ -1,4 +1,5 @@
 import os
+import re
 import json
 
 from auth import get_token
@@ -20,8 +21,25 @@ from logger import (
     log_session_start,
     get_processed_count,
     reset_processed_count,
-    count_document_json
+    count_document_json,
+    start_project,
+    log_processed,
+    log_failed,
 )
+
+
+def sanitize_for_filename(raw):
+    """
+    Make a string safe to use in a filename. Keeps letters, digits,
+    '-', '_', '.'; replaces every other run of characters with a single
+    underscore. Returns "" for empty/None so the caller can fall back.
+    Mirrors the C# SanitizeForFileName so SmarTeam and GraphAPI agree.
+    """
+    if not raw:
+        return ""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw))
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_. ")
 
 # ==========================================
 # DEBUG
@@ -109,10 +127,6 @@ def main():
 
     for project_index, project_file in enumerate(project_files, start=1):
 
-        log("\n================================")
-        log(f"🚀 PROCESSING ({project_index}/{len(project_files)}):", project_file)
-        log("================================")
-
         # ==================================
         # FILE PATHS
         # ==================================
@@ -127,14 +141,9 @@ def main():
             project_file
         )
 
-        log("\n📁 Project JSON:")
-        log(project_json_path)
-
-        log("\n📁 Document JSON:")
-        log(document_json_path)
-
         # ==================================
-        # READ PROJECT JSON
+        # READ PROJECT JSON (before starting the per-project log,
+        # so we can name files by the project's TDMX_ID)
         # ==================================
 
         with open(
@@ -144,6 +153,37 @@ def main():
         ) as f:
 
             project_json = json.load(f)
+
+        # Derive the TDX (TDMX_ID) for log/CSV filenames.
+        # Project JSON is usually a list with one project object.
+        def _extract_tdmx(pj):
+            if isinstance(pj, list):
+                for n in pj:
+                    if isinstance(n, dict) and n.get("TDMX_ID"):
+                        return n.get("TDMX_ID")
+            elif isinstance(pj, dict):
+                return pj.get("TDMX_ID")
+            return None
+
+        tdmx_id = _extract_tdmx(project_json)
+        stem = os.path.splitext(project_file)[0]
+
+        # Use TDMX_ID for filenames; fall back to the filename stem if
+        # the project JSON has no TDMX_ID. Sanitize for the filesystem.
+        project_tag = sanitize_for_filename(tdmx_id) or stem
+
+        start_project(project_tag)
+
+        log("\n================================")
+        log(f"🚀 PROCESSING ({project_index}/{len(project_files)}):", project_file)
+        log(f"   TDMX_ID: {tdmx_id} | file tag: {project_tag}")
+        log("================================")
+
+        log("\n📁 Project JSON:")
+        log(project_json_path)
+
+        log("\n📁 Document JSON:")
+        log(document_json_path)
 
         log(
             "\n📄 Project JSON Type:",
@@ -165,6 +205,13 @@ def main():
                     sp,
                     base
                 )
+                log_processed(
+                    project_node,
+                    node_type="PROJECT",
+                    status="Success",
+                    sharepoint_path=project_root or "",
+                    detail="Project root created",
+                )
 
         elif isinstance(project_json, dict):
 
@@ -172,6 +219,13 @@ def main():
                 project_json,
                 sp,
                 base
+            )
+            log_processed(
+                project_json,
+                node_type="PROJECT",
+                status="Success",
+                sharepoint_path=project_root or "",
+                detail="Project root created",
             )
 
         log(

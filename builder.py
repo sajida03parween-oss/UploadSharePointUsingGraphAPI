@@ -2,6 +2,7 @@ from platform import node
 
 import requests
 import os
+import csv
 from vault import get_file
 from utils import sanitize
 from metadata import get_type, build_metadata
@@ -10,10 +11,93 @@ from config import FORCE_METADATA_UPDATE
 from logger import (
     log,
     increment_processed,
-    get_processed_count
+    get_processed_count,
+    log_failed,
+    log_processed,
 )
 
-FAILED_FILE = "failed_files.txt"
+# Folder-name problems are also recorded in the per-project failed CSV,
+# but we keep a simple flat list too for quick scanning.
+INVALID_FOLDER_FILE = "invalid_folders.txt"
+
+# =========================================================
+# Duplicate handling
+#
+# Two file rows are "the same upload" when they resolve to the
+# SAME final SharePoint path (folder + final filename). The first
+# one uploads; any later row with an identical path is SKIPPED and
+# recorded in DUPLICATES_FILE with its full details.
+#
+# Same file in a DIFFERENT folder, or a DIFFERENT revision, produces
+# a different path and is therefore NOT a duplicate — it still uploads.
+# =========================================================
+
+DUPLICATES_FILE = "duplicates.csv"
+
+# In-memory set of upload paths already seen THIS run (case-insensitive)
+_seen_upload_paths = set()
+
+# Header written once, lazily, on the first duplicate
+_DUP_HEADER = [
+    "Reason",
+    "UploadPath",
+    "Description",
+    "FILE_NAME",
+    "CAD_REF_FILE_NAME",
+    "REVISION",
+    "REVISION_STG",
+    "TDM_FILE_ID",
+    "ROOT_DIR_ON_SERVER",
+    "FILE_SIZE",
+    "DESIGN_MODULE",
+    "Path",
+]
+
+
+def _dup_row(node, upload_path, reason="Duplicate upload path (same file, same folder)"):
+    return [
+        reason,
+        upload_path,
+        node.get("Description", ""),
+        node.get("FILE_NAME", ""),
+        node.get("CAD_REF_FILE_NAME", ""),
+        node.get("REVISION", ""),
+        node.get("REVISION_STG", ""),
+        node.get("TDM_FILE_ID", ""),
+        node.get("ROOT_DIR_ON_SERVER", ""),
+        node.get("FILE_SIZE", ""),
+        node.get("DESIGN_MODULE", ""),
+        node.get("Path", ""),
+    ]
+
+
+def log_duplicate(node, upload_path, reason="Duplicate upload path (same file, same folder)"):
+    """Append a skipped-duplicate record (full details) to duplicates.csv."""
+    write_header = not os.path.exists(DUPLICATES_FILE)
+    try:
+        with open(DUPLICATES_FILE, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(_DUP_HEADER)
+            w.writerow(_dup_row(node, upload_path, reason))
+    except Exception as e:
+        log(f"⚠️ Could not write duplicate record: {e}")
+
+
+def is_duplicate_upload(upload_path):
+    """
+    True if this upload path was already handled this run.
+    Registers the path as seen when it is new (returns False then).
+    """
+    key = (upload_path or "").strip().lower()
+    if not key:
+        return False
+    if key in _seen_upload_paths:
+        return True
+    _seen_upload_paths.add(key)
+    return False
+
+
 # =========================================================
 # Recursive Processor
 # =========================================================
@@ -42,6 +126,34 @@ def process(node, sp, parent):
             ]
         )
 
+        # ==========================================
+        # INVALID FOLDER CHECK
+        # ==========================================
+
+        if not folder_name:
+            log_invalid_folder(node)
+            log_failed(
+                node,
+                stage="FOLDER_NAMING",
+                reason=f"Empty folder name (CAD='{cad_identifier}', DESC='{description}')",
+                node_type="FOLDER",
+            )
+
+            log(
+                "\n❌ INVALID FOLDER NAME DETECTED"
+            )
+            log(
+                f"CAD_IDENTIFIER: {cad_identifier}"
+            )
+            log(
+                f"DESCRIPTION: {description}"
+            )
+
+            folder_name = (
+                node.get("TDMX_ID")
+                or "INVALID_FOLDER"
+            )
+
         folder_name = sanitize(
             folder_name
         )
@@ -60,18 +172,46 @@ def process(node, sp, parent):
         # Create Folder
         # =================================================
 
-        sp.ensure_path(current_path)
+        folder_status = "Success"
+        folder_detail = ""
+
+        try:
+            sp.ensure_path(current_path)
+        except Exception as e:
+            folder_status = "Failure"
+            folder_detail = f"ensure_path error: {e}"
+            log("❌ Folder create error:", str(e))
+            log_failed(
+                node,
+                stage="FOLDER_CREATE",
+                reason=str(e),
+                node_type="FOLDER",
+                upload_path=current_path,
+            )
 
         # =================================================
         # Get SharePoint Folder Item
         # =================================================
 
-        folder_res = requests.get(
-            f"https://graph.microsoft.com/v1.0/drives/{sp.drive_id}/root:/{current_path}",
-            headers=sp.get_headers()
-        )
+        try:
+            folder_res = requests.get(
+                f"https://graph.microsoft.com/v1.0/drives/{sp.drive_id}/root:/{current_path}",
+                headers=sp.get_headers()
+            )
+        except Exception as e:
+            folder_res = None
+            folder_status = "Failure"
+            folder_detail = f"folder fetch error: {e}"
+            log("❌ Folder fetch exception:", str(e))
+            log_failed(
+                node,
+                stage="FOLDER_FETCH",
+                reason=str(e),
+                node_type="FOLDER",
+                upload_path=current_path,
+            )
 
-        if folder_res.status_code == 200:
+        if folder_res is not None and folder_res.status_code == 200:
 
             folder_item = folder_res.json()
 
@@ -90,17 +230,63 @@ def process(node, sp, parent):
 
                 log("📝 Applying Folder Metadata")
 
-                sp.metadata(
-                    folder_id,
-                    metadata
-                )
+                try:
+                    meta_res = sp.metadata(
+                        folder_id,
+                        metadata
+                    )
+                    if meta_res and meta_res.get("success"):
+                        log("✅ Folder Metadata Applied")
+                    else:
+                        err = (meta_res or {}).get("error", "unknown metadata error")
+                        status_code = (meta_res or {}).get("status", "")
+                        folder_status = "Failure"
+                        folder_detail = (
+                            f"Folder created but metadata failed "
+                            f"(HTTP {status_code}): {str(err)[:200]}"
+                        )
+                        log("❌ Folder metadata FAILED:", folder_detail)
+                        log_failed(
+                            node,
+                            stage="FOLDER_METADATA",
+                            reason=f"Metadata failed (HTTP {status_code}): {str(err)[:300]}",
+                            node_type="FOLDER",
+                            upload_path=current_path,
+                        )
+                except Exception as e:
+                    folder_status = "Failure"
+                    folder_detail = f"metadata error: {e}"
+                    log("❌ Folder metadata error:", str(e))
+                    log_failed(
+                        node,
+                        stage="FOLDER_METADATA",
+                        reason=str(e),
+                        node_type="FOLDER",
+                        upload_path=current_path,
+                    )
 
-                log("✅ Folder Metadata Applied")
+        elif folder_res is not None:
 
-        else:
-
+            folder_status = "Failure"
+            folder_detail = f"fetch status {folder_res.status_code}"
             log("❌ Failed to fetch folder")
             log(folder_res.text)
+            log_failed(
+                node,
+                stage="FOLDER_FETCH",
+                reason=f"HTTP {folder_res.status_code}: {folder_res.text[:300]}",
+                node_type="FOLDER",
+                upload_path=current_path,
+            )
+
+        # Record the folder node in the per-project processed CSV
+        log_processed(
+            node,
+            node_type="FOLDER",
+            status=folder_status,
+            sharepoint_path=current_path,
+            detail=folder_detail,
+        )
 
         # =================================================
         # Recursive Children
@@ -136,6 +322,38 @@ def process(node, sp, parent):
         log("Path:", node.get("Path"))
 
         # =================================================
+        # DUPLICATE SKIP (same file, same folder, same name)
+        #
+        # Use SmarTeam's precomputed UploadPath as the dedup key.
+        # If we've already handled this exact destination this run,
+        # skip BEFORE the costly vault fetch / upload, and record it
+        # in duplicates.csv with full details.
+        #
+        # Different folder or different revision => different
+        # UploadPath => NOT a duplicate => still uploaded.
+        # =================================================
+
+        dedup_key = (node.get("UploadPath") or "").strip()
+
+        if dedup_key and is_duplicate_upload(dedup_key):
+
+            log("\n⏭️ DUPLICATE — skipping (already handled this run):")
+            log(dedup_key)
+
+            log_duplicate(node, dedup_key)
+            log_processed(
+                node,
+                node_type="FILE",
+                status="Skipped(Duplicate)",
+                sharepoint_path=dedup_key,
+                detail="Same UploadPath already handled this run",
+            )
+
+            count = increment_processed()
+            log(f"📈 Progress: {count} files processed so far")
+            return
+
+        # =================================================
         # Get vault file
         # =================================================
 
@@ -144,6 +362,20 @@ def process(node, sp, parent):
         if not local_file:
 
             log("❌ File not found in vault")
+            log_failed(
+                node,
+                stage="VAULT_MISSING",
+                reason="File not found in vault (ROOT_DIR_ON_SERVER + FILE_NAME)",
+                node_type="FILE",
+                upload_path=dedup_key,
+            )
+            log_processed(
+                node,
+                node_type="FILE",
+                status="Failure",
+                sharepoint_path=dedup_key,
+                detail="Vault file missing",
+            )
             # Count this as processed (handled) even though it failed,
             # so progress count reflects every file node we visited.
             count = increment_processed()
@@ -151,58 +383,65 @@ def process(node, sp, parent):
             return
 
         # =================================================
-        # Upload Name Logic
+        # Upload Name + Path Logic
+        #
+        # SmarTeam now PRECOMPUTES the upload filename and the
+        # previous-revision decision. GraphAPI reads "UploadPath"
+        # (project-relative, e.g. "<Project>/<folder>/.../<file>")
+        # and reuses ITS TAIL — the final filename and the
+        # previous_revision flag — instead of recomputing CAD-ref
+        # vs FILE_NAME and the revision branch on the fly.
+        #
+        # The folder is still anchored on GraphAPI's own `parent`
+        # base (GraphAPI/<project tree>) so the two path bases stay
+        # consistent regardless of how SmarTeam names its root.
+        #
+        # Falls back to the legacy computation when UploadPath is
+        # absent (older CSV/JSON files still work).
         # =================================================
 
-        original_name = (
-            node.get("FILE_NAME")
-        )
+        original_name = node.get("FILE_NAME")
+        cad_ref_name = node.get("CAD_REF_FILE_NAME")
+        precomputed_upload = (node.get("UploadPath") or "").strip()
 
-        cad_ref_name = (
-            node.get("CAD_REF_FILE_NAME")
-        )
+        if precomputed_upload:
 
-        json_path = (
-            node.get("Path", "")
-        ).lower()
+            # ---- BLIND PATH: trust SmarTeam's computation ----
+            normalized = precomputed_upload.replace("\\", "/")
 
-        is_previous_revision = (
-            "previous_revision"
-            in json_path
-        )
+            # Final upload filename = last path segment
+            upload_name = normalized.rsplit("/", 1)[-1]
 
-        # =============================================
-        # Previous Revision
-        # Keep original filename
-        # =============================================
+            # Previous-revision decision = presence of the marker folder
+            is_previous_revision = (
+                "/previous_revision/" in normalized.lower()
+            )
 
-        if is_previous_revision:
-
-            upload_name = original_name
-
-        # =============================================
-        # Normal files
-        # Use CAD_REF_FILE_NAME
-        # =============================================
+            log("\n🚀 Upload Details (from SmarTeam UploadPath)")
+            log("UploadPath:", precomputed_upload)
+            log("Final Upload Name:", upload_name)
 
         else:
 
-            upload_name = (
-                cad_ref_name
-                or original_name
+            # ---- FALLBACK: legacy on-the-fly computation ----
+            json_path = (node.get("Path", "") or "").lower()
+
+            is_previous_revision = (
+                "previous_revision" in json_path
             )
 
-        log("\n🚀 Upload Details")
-        log("Original Name:", original_name)
-        log("CAD Ref Name:", cad_ref_name)
-        log("Final Upload Name:", upload_name)
+            if is_previous_revision:
+                upload_name = original_name
+            else:
+                upload_name = cad_ref_name or original_name
+
+            log("\n🚀 Upload Details (computed)")
+            log("Original Name:", original_name)
+            log("CAD Ref Name:", cad_ref_name)
+            log("Final Upload Name:", upload_name)
 
         # =================================================
-        # Upload Path
-        # =================================================
-
-        # =================================================
-        # Previous Revision Folder
+        # Target Folder (anchored on GraphAPI parent base)
         # =================================================
 
         target_folder = parent
@@ -231,19 +470,40 @@ def process(node, sp, parent):
         log(full_sharepoint_path)
 
         # =================================================
-        # CHECKPOINT SKIP
+        # DUPLICATE SKIP (fallback)
+        #
+        # If the node had no precomputed UploadPath, the early check
+        # above couldn't run. Dedup here on the computed path instead,
+        # so older CSV/JSON (without UploadPath) is still de-duplicated.
         # =================================================
 
+        if not dedup_key:
+
+            if is_duplicate_upload(full_sharepoint_path):
+
+                log("\n⏭️ DUPLICATE — skipping (already handled this run):")
+                log(full_sharepoint_path)
+
+                log_duplicate(node, full_sharepoint_path)
+                log_processed(
+                    node,
+                    node_type="FILE",
+                    status="Skipped(Duplicate)",
+                    sharepoint_path=full_sharepoint_path,
+                    detail="Same path already handled this run",
+                )
+
+                count = increment_processed()
+                log(f"📈 Progress: {count} files processed so far")
+                return
+
+        # =================================================
+        # Status tracking for this file
+        # =================================================
+
+        file_status = "Success"
+        file_detail = ""
         already_processed = False
-
-        if is_processed(full_sharepoint_path):
-
-            log(
-                "⏭️ Already Processed:",
-                full_sharepoint_path
-            )
-
-            already_processed = True
 
         # =================================================
         # SHAREPOINT EXISTENCE CHECK
@@ -257,9 +517,14 @@ def process(node, sp, parent):
 
                 if not item:
 
+                    file_status = "Failure"
+                    file_detail = "Unable to get SharePoint item for metadata update"
                     log_failed(
-                        full_sharepoint_path,
-                        "Unable to get SharePoint item"
+                        node,
+                        stage="METADATA_GET_ITEM",
+                        reason="Unable to get SharePoint item",
+                        node_type="FILE",
+                        upload_path=full_sharepoint_path,
                     )
 
                 else:
@@ -269,38 +534,96 @@ def process(node, sp, parent):
                         "FILE"
                     )
 
-                    sp.metadata(
-                        item["id"],
-                        metadata
-                    )
-                log(
-                    "✅ Metadata Force Updated"
-                )
-            else :
+                    try:
+                        meta_res = sp.metadata(
+                            item["id"],
+                            metadata
+                        )
+                        if meta_res and meta_res.get("success"):
+                            file_detail = "Metadata force-updated (already existed)"
+                            log("✅ Metadata Force Updated")
+                        else:
+                            err = (meta_res or {}).get("error", "unknown metadata error")
+                            status_code = (meta_res or {}).get("status", "")
+                            file_status = "Failure"
+                            file_detail = (
+                                f"Already existed but metadata update failed "
+                                f"(HTTP {status_code}): {str(err)[:200]}"
+                            )
+                            log("❌ Metadata Force Update FAILED:", file_detail)
+                            log_failed(
+                                node,
+                                stage="METADATA_UPDATE",
+                                reason=f"Metadata update failed (HTTP {status_code}): {str(err)[:300]}",
+                                node_type="FILE",
+                                upload_path=full_sharepoint_path,
+                            )
+                    except Exception as e:
+                        file_status = "Failure"
+                        file_detail = f"metadata update error: {e}"
+                        log("❌ Metadata update error:", str(e))
+                        log_failed(
+                            node,
+                            stage="METADATA_UPDATE",
+                            reason=str(e),
+                            node_type="FILE",
+                            upload_path=full_sharepoint_path,
+                        )
+            else:
+                file_detail = "Already exists in SharePoint"
                 log(
                     "⏭️ Already Exists in SharePoint:",
                     full_sharepoint_path
                 )
 
-            #mark_processed(full_sharepoint_path)
             already_processed = True
 
         # =================================================
         # Upload File
         # =================================================
         if not already_processed:
-            uploaded = sp.upload(
-                local_file,
-                full_sharepoint_path
-            )
+
+            try:
+                uploaded = sp.upload(
+                    local_file,
+                    full_sharepoint_path
+                )
+            except Exception as e:
+                log("❌ Upload exception:", str(e))
+                log_failed(
+                    node,
+                    stage="UPLOAD",
+                    reason=f"Upload exception: {e}",
+                    node_type="FILE",
+                    upload_path=full_sharepoint_path,
+                )
+                log_processed(
+                    node,
+                    node_type="FILE",
+                    status="Failure",
+                    sharepoint_path=full_sharepoint_path,
+                    detail=f"Upload exception: {e}",
+                )
+                count = increment_processed()
+                log(f"📈 Progress: {count} files processed so far")
+                return
 
             if uploaded is None:
 
                 log_failed(
-                    full_sharepoint_path,
-                    "Upload returned None"
+                    node,
+                    stage="UPLOAD",
+                    reason="Upload returned None",
+                    node_type="FILE",
+                    upload_path=full_sharepoint_path,
                 )
-                # Still counts as a handled file node
+                log_processed(
+                    node,
+                    node_type="FILE",
+                    status="Failure",
+                    sharepoint_path=full_sharepoint_path,
+                    detail="Upload returned None",
+                )
                 count = increment_processed()
                 log(f"📈 Progress: {count} files processed so far")
                 return
@@ -308,9 +631,22 @@ def process(node, sp, parent):
             if not uploaded["success"]:
 
                 log("❌ Upload failed")
+                # Distinguish chunked-upload failures for clearer triage
+                err = str(uploaded.get("error", ""))
+                stage = "CHUNK_UPLOAD" if "chunk" in err.lower() else "UPLOAD"
                 log_failed(
-                    full_sharepoint_path,
-                    uploaded["error"]
+                    node,
+                    stage=stage,
+                    reason=err,
+                    node_type="FILE",
+                    upload_path=full_sharepoint_path,
+                )
+                log_processed(
+                    node,
+                    node_type="FILE",
+                    status="Failure",
+                    sharepoint_path=full_sharepoint_path,
+                    detail=err[:300],
                 )
                 count = increment_processed()
                 log(f"📈 Progress: {count} files processed so far")
@@ -335,16 +671,56 @@ def process(node, sp, parent):
 
                 log("📝 Applying File Metadata")
 
-                sp.metadata(
-                    file_id,
-                    metadata
-                )
+                try:
+                    meta_res = sp.metadata(
+                        file_id,
+                        metadata
+                    )
+                    if meta_res and meta_res.get("success"):
+                        log("✅ File Metadata Applied")
+                    else:
+                        # File uploaded OK, but metadata failed.
+                        err = (meta_res or {}).get("error", "unknown metadata error")
+                        status_code = (meta_res or {}).get("status", "")
+                        file_status = "Failure"
+                        file_detail = (
+                            f"Uploaded success but metadata failed "
+                            f"(HTTP {status_code}): {str(err)[:200]}"
+                        )
+                        log("❌ File metadata FAILED (upload was OK):", file_detail)
+                        log_failed(
+                            node,
+                            stage="METADATA",
+                            reason=f"Upload OK but metadata failed (HTTP {status_code}): {str(err)[:300]}",
+                            node_type="FILE",
+                            upload_path=full_sharepoint_path,
+                        )
+                except Exception as e:
+                    file_status = "Failure"
+                    file_detail = f"Uploaded success but metadata exception: {e}"
+                    log("❌ File metadata error:", str(e))
+                    log_failed(
+                        node,
+                        stage="METADATA",
+                        reason=f"Upload OK but metadata exception: {e}",
+                        node_type="FILE",
+                        upload_path=full_sharepoint_path,
+                    )
 
-                log("✅ File Metadata Applied")
+        # =================================================
+        # Record processed status for this file
+        # =================================================
 
-            mark_processed(
-                full_sharepoint_path
-            )
+        if file_status == "Success" and not file_detail:
+            file_detail = "Uploaded" if not already_processed else "Already existed"
+
+        log_processed(
+            node,
+            node_type="FILE",
+            status=file_status,
+            sharepoint_path=full_sharepoint_path,
+            detail=file_detail,
+        )
 
         # =================================================
         # PROGRESS — single line, every file completion
@@ -372,51 +748,20 @@ def process(node, sp, parent):
                 parent
             )
 #------------------------------------------------
-# Add Checkpoint
+# Invalid folder flat log (quick-scan companion to failed CSV)
 #------------------------------------------------
 
-CHECKPOINT_FILE = "processed_files.txt"
-
-def is_processed(path):
-
-    if not os.path.exists(CHECKPOINT_FILE):
-        return False
+def log_invalid_folder(node):
 
     with open(
-        CHECKPOINT_FILE,
-        "r",
-        encoding="utf-8"
-    ) as f:
-
-        processed = {
-            line.strip()
-            for line in f
-        }
-
-    return path in processed
-
-#---------------------------------------
-# Failed Logs
-#---------------------------------------
-
-def mark_processed(path):
-
-    with open(
-        CHECKPOINT_FILE,
-        "a",
-        encoding="utf-8"
-    ) as f:
-
-        f.write(path + "\n")
-
-def log_failed(path, error):
-
-    with open(
-        FAILED_FILE,
+        INVALID_FOLDER_FILE,
         "a",
         encoding="utf-8"
     ) as f:
 
         f.write(
-            f"{path} | {error}\n"
+            f"ObjectId={node.get('OBJECT_ID') or node.get('ObjectId')} | "
+            f"TDMX_ID={node.get('TDMX_ID')} | "
+            f"Description={node.get('Description')} | "
+            f"CAD={node.get('TDMX_CAD_IDENTIFIER')}\n"
         )

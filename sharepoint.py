@@ -383,22 +383,74 @@ class SharePoint:
     # METADATA
     # =====================================================
 
-    def metadata(self, item_id, data):
+    def metadata(self, item_id, data, retries=3, retry_wait=5):
+        """
+        Apply list-item metadata via PATCH.
 
-        res = requests.patch(
-            f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/items/{item_id}/listItem/fields",
-            headers={
-               **self.get_headers(),
-                "Content-Type": "application/json"
-            },
-            json=data
-        )
+        Returns a result dict so callers can detect failure:
+            {"success": True,  "status": <code>}
+            {"success": False, "status": <code|0>, "error": "<text>"}
 
-        log("Metadata:", res.status_code)
+        Retries on transient failures (e.g. 429/503/5xx) up to `retries`
+        attempts, waiting `retry_wait` seconds between tries.
+        """
+        import time
 
-        if res.status_code not in [200, 201]:
+        last_status = 0
+        last_error = ""
 
+        for attempt in range(1, retries + 1):
+
+            try:
+                res = requests.patch(
+                    f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/items/{item_id}/listItem/fields",
+                    headers={
+                       **self.get_headers(),
+                        "Content-Type": "application/json"
+                    },
+                    json=data,
+                    timeout=120
+                )
+            except Exception as e:
+                last_status = 0
+                last_error = f"PATCH exception: {e}"
+                log(f"⚠️ Metadata attempt {attempt}/{retries} exception: {e}")
+                if attempt < retries:
+                    log(f"⏳ Waiting {retry_wait}s before metadata retry...")
+                    time.sleep(retry_wait)
+                continue
+
+            last_status = res.status_code
+            log("Metadata:", res.status_code)
+
+            if res.status_code in [200, 201]:
+                return {"success": True, "status": res.status_code}
+
+            # Non-success — capture body, decide whether to retry
+            last_error = res.text
             log(res.text)
+
+            # Retry on transient/server errors; give up immediately on
+            # clear client errors (4xx other than 429 throttling).
+            transient = (
+                res.status_code == 429
+                or res.status_code >= 500
+            )
+
+            if transient and attempt < retries:
+                log(f"🔁 Metadata transient {res.status_code} — retry "
+                    f"{attempt}/{retries} after {retry_wait}s...")
+                time.sleep(retry_wait)
+                continue
+
+            # Non-transient, or out of retries
+            break
+
+        return {
+            "success": False,
+            "status": last_status,
+            "error": last_error or f"HTTP {last_status}"
+        }
 
 #------------------------------------------------
 # Get Path

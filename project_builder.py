@@ -1,3 +1,5 @@
+from platform import node
+
 import requests
 
 from utils import sanitize
@@ -15,11 +17,18 @@ def build_project_tree(
     # Project Name
     # ==========================================
 
-    project_name = sanitize(
+    cad_identifier = (
+        node.get("CN_REFERENCE_PROJECT")
+        or ""
+    ).strip()
+
+    description = (
         node.get("TDM_DESCRIPTION")
-        or node.get("TITLE")
-        or node.get("TDMX_ID")
-        or "Unnamed_Project"
+        or ""
+    ).strip()
+
+    project_name = sanitize(
+        f"[{cad_identifier}] {description}"
     )
 
     current_path = (
