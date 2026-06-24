@@ -29,6 +29,11 @@ _processed_count = 0           # Global "files processed" counter
 
 _current_project_id = None     # Project id stem (e.g. "3476") for filenames
 
+# A per-run stamp so each execution writes its OWN processed_/failed_
+# CSV (instead of appending to a shared one). This lets --resume read
+# all prior runs' processed CSVs while never overwriting them.
+_RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+
 
 # =========================================================
 # Filename helpers
@@ -278,7 +283,7 @@ _FAILED_HEADER = [
 
 def _failed_csv_path():
     pid = _current_project_id or "unknown"
-    name = f"{FAILED_PREFIX}_{pid}.csv"
+    name = f"{FAILED_PREFIX}_{pid}_{_RUN_ID}.csv"
     return os.path.join(LOG_DIR, name) if LOG_DIR else name
 
 
@@ -371,7 +376,7 @@ _PROCESSED_HEADER = [
 
 def _processed_csv_path():
     pid = _current_project_id or "unknown"
-    name = f"{PROCESSED_PREFIX}_{pid}.csv"
+    name = f"{PROCESSED_PREFIX}_{pid}_{_RUN_ID}.csv"
     return os.path.join(LOG_DIR, name) if LOG_DIR else name
 
 
@@ -449,6 +454,92 @@ def log_processed(node, node_type, status, sharepoint_path="", detail=""):
             w.writerow(row)
     except Exception as e:
         log(f"⚠️ Could not write processed record: {e}")
+
+
+def load_done_paths(project_id, done_statuses=("Success", "Skipped(Duplicate)")):
+    """
+    For --resume: scan ALL prior processed_<project_id>_*.csv files in
+    LOG_DIR and return a set of SharePointPath values whose Status is in
+    done_statuses. These are the nodes (folders + files) already handled
+    by previous runs, so the current run can skip them.
+
+    The current run's own processed CSV (named with this run's _RUN_ID)
+    won't exist yet when this is called at startup, so it's naturally
+    excluded. Matching is exact on the SharePointPath column, which for
+    files already includes the filename.
+    """
+    pid = str(project_id) if project_id is not None else "unknown"
+    # Prior runs may have used either naming scheme:
+    #   processed_<pid>.csv            (old: no run-id)
+    #   processed_<pid>_<runid>.csv    (new: per-run)
+    # Match BOTH so a crash on the old code can still be resumed.
+    exact = f"{PROCESSED_PREFIX}_{pid}.csv"
+    prefix = f"{PROCESSED_PREFIX}_{pid}_"
+    folder = LOG_DIR if LOG_DIR else "."
+
+    done = set()
+    current_run_file = f"{PROCESSED_PREFIX}_{pid}_{_RUN_ID}.csv"
+    try:
+        names = [
+            n for n in os.listdir(folder)
+            if n.endswith(".csv")
+            and (n == exact or n.startswith(prefix))
+            and n != current_run_file        # never read our own output
+        ]
+    except FileNotFoundError:
+        names = []
+
+    for name in names:
+        full = os.path.join(folder, name) if folder else name
+        try:
+            with open(full, "r", encoding="utf-8-sig", newline="") as f:
+                for row in csv.DictReader(f, delimiter=";"):
+                    if (row.get("Status") or "").strip() in done_statuses:
+                        sp = (row.get("SharePointPath") or "").strip()
+                        if sp:
+                            done.add(sp)
+        except Exception as e:
+            log(f"⚠️ Could not read prior processed file {name}: {e}")
+
+    log(f"🔁 Resume: loaded {len(done)} already-done paths "
+        f"from {len(names)} prior processed file(s) for {pid}")
+    return done
+
+
+def log_not_reached(csv_row):
+    """
+    Log a Documents_Tree CSV row that was never visited by the builder.
+    Maps the CSV columns (comma-separated, SmarTeam output) to the
+    processed CSV format and writes status="Not reached".
+
+    csv_row: dict from csv.DictReader of Documents_Tree_<id>.csv
+    """
+    has_root = bool((csv_row.get("ROOT_DIR_ON_SERVER") or "").strip())
+    node_type = "FILE" if has_root else "FOLDER"
+
+    # Map Documents_Tree CSV columns -> processed node dict
+    node = {
+        "OBJECT_ID":          csv_row.get("DocObjectId", ""),
+        "TDMX_ID":            csv_row.get("TDMX_ID", ""),
+        "Description":        csv_row.get("Description", ""),
+        "FILE_NAME":          csv_row.get("FILE_NAME", ""),
+        "CAD_REF_FILE_NAME":  csv_row.get("CAD_REF_FILE_NAME", ""),
+        "REVISION":           csv_row.get("REVISION", ""),
+        "FILE_SIZE":          csv_row.get("FILE_SIZE", ""),
+        "FILE_SIZE_DISPLAY":  "",      # not in Documents_Tree CSV
+        "Path":               csv_row.get("DocPath", ""),
+        "ExtractTimestamp":   csv_row.get("ExtractTimestamp", ""),
+        "TDMX_CAD_IDENTIFIER":csv_row.get("TDMX_CAD_IDENTIFIER", ""),
+        "CN_REFERENCE_PROJECT": "",    # not a project node
+    }
+
+    log_processed(
+        node,
+        node_type=node_type,
+        status="Not reached",
+        sharepoint_path=csv_row.get("UploadPath", ""),
+        detail="In Documents_Tree CSV but not visited by builder (not in JSON tree or parent failed)",
+    )
 
 
 # =========================================================

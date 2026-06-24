@@ -1,6 +1,6 @@
 import os
 import re
-import json
+import csv
 
 from auth import get_token
 from sharepoint import SharePoint
@@ -9,22 +9,23 @@ from project_builder import (
     build_project_tree
 )
 
-from builder import process
+from builder import process, set_resume_done
+
+from utils import sanitize
 
 from config import (
     PROJECT_FOLDER,
-    DOCUMENT_FOLDER
+    DOCUMENT_CSV_FOLDER,
 )
 
 from logger import (
     log,
     log_session_start,
     get_processed_count,
-    reset_processed_count,
-    count_document_json,
     start_project,
     log_processed,
     log_failed,
+    load_done_paths,
 )
 
 
@@ -55,29 +56,31 @@ log(os.getcwd())
 log("\nPROJECT_FOLDER:")
 log(PROJECT_FOLDER)
 
-log("\nDOCUMENT_FOLDER:")
-log(DOCUMENT_FOLDER)
+log("\nDOCUMENT_CSV_FOLDER:")
+log(DOCUMENT_CSV_FOLDER)
 
 log("\nPROJECT EXISTS:")
-log(os.path.exists(PROJECT_FOLDER))
+log(os.path.exists(PROJECT_FOLDER) if PROJECT_FOLDER else False)
 
-log("\nDOCUMENT EXISTS:")
-log(os.path.exists(DOCUMENT_FOLDER))
+log("\nDOCUMENT_CSV_FOLDER EXISTS:")
+log(os.path.exists(DOCUMENT_CSV_FOLDER) if DOCUMENT_CSV_FOLDER else False)
 
-if os.path.exists(PROJECT_FOLDER):
-
+if PROJECT_FOLDER and os.path.exists(PROJECT_FOLDER):
     log("\nPROJECT FILES:")
     log(os.listdir(PROJECT_FOLDER))
 
-if os.path.exists(DOCUMENT_FOLDER):
-
-    log("\nDOCUMENT FILES:")
-    log(os.listdir(DOCUMENT_FOLDER))
+if DOCUMENT_CSV_FOLDER and os.path.exists(DOCUMENT_CSV_FOLDER):
+    log("\nDOCUMENT CSV FILES:")
+    log([f for f in os.listdir(DOCUMENT_CSV_FOLDER) if f.startswith("Documents_Tree")])
 
 log("=======================================\n")
 
 
-def main():
+def main(resume=False):
+
+    if resume:
+        log("\n🔁 RESUME MODE ON — already-completed nodes "
+            "(Success/Skipped) from prior runs will be skipped.")
 
     # ======================================
     # AUTH
@@ -91,21 +94,17 @@ def main():
     # ROOT FOLDER
     # ======================================
 
-    base = "GraphAPI"
+    base = "Testing_saj"
 
     sp.ensure_path(base)
 
     # ======================================
-    # PROJECT FILES
+    # PROJECT FILES (Projects_Tree_<id>.csv)
     # ======================================
 
     project_files = [
-
-        f for f in os.listdir(
-            PROJECT_FOLDER
-        )
-
-        if f.endswith(".json")
+        f for f in os.listdir(PROJECT_FOLDER)
+        if f.startswith("Projects_Tree") and f.endswith(".csv")
     ]
 
     log(
@@ -131,233 +130,309 @@ def main():
         # FILE PATHS
         # ==================================
 
-        project_json_path = os.path.join(
+        project_csv_path = os.path.join(
             PROJECT_FOLDER,
             project_file
         )
 
-        document_json_path = os.path.join(
-            DOCUMENT_FOLDER,
-            project_file
-        )
-
         # ==================================
-        # READ PROJECT JSON (before starting the per-project log,
-        # so we can name files by the project's TDMX_ID)
+        # READ PROJECT TREE CSV
+        # One row per project node. Columns:
+        #   LEVEL, PARENT_ID, CHILD_ID, TDMX_ID, TDM_DESCRIPTION,
+        #   CN_REFERENCE_PROJECT, USER_OBJECT_ID, MODIFICATION_DATE,
+        #   CN_REF_PM_PT, CN_PROJECT_TYPE, TDMX_CUSTOMER, TDMX_COMMENTS,
+        #   CN_CLASSIFICATION, CREATION_DATE, TITLE, DETAILS, FULL_PATH
+        # We rebuild the parent→children tree from PARENT_ID/CHILD_ID
+        # so build_project_tree() can recurse exactly as it did on JSON.
         # ==================================
 
-        with open(
-            project_json_path,
-            "r",
-            encoding="utf-8-sig"
-        ) as f:
+        proj_rows = []
+        with open(project_csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            for r in csv.DictReader(f):
+                # skip any summary/blank rows defensively
+                if (r.get("CHILD_ID") or "").strip():
+                    proj_rows.append(r)
 
-            project_json = json.load(f)
+        if not proj_rows:
+            log(f"\n⚠️ Project CSV empty: {project_csv_path}")
+            continue
 
-        # Derive the TDX (TDMX_ID) for log/CSV filenames.
-        # Project JSON is usually a list with one project object.
-        def _extract_tdmx(pj):
-            if isinstance(pj, list):
-                for n in pj:
-                    if isinstance(n, dict) and n.get("TDMX_ID"):
-                        return n.get("TDMX_ID")
-            elif isinstance(pj, dict):
-                return pj.get("TDMX_ID")
-            return None
+        # Build node dicts keyed by CHILD_ID, with a children list.
+        proj_nodes = {}
+        for r in proj_rows:
+            cid = r["CHILD_ID"].strip()
+            proj_nodes[cid] = {
+                "OBJECT_ID":            cid,
+                "TDMX_ID":              r.get("TDMX_ID", ""),
+                "TDM_DESCRIPTION":      r.get("TDM_DESCRIPTION", ""),
+                "CN_REFERENCE_PROJECT": r.get("CN_REFERENCE_PROJECT", ""),
+                "USER_OBJECT_ID":       r.get("USER_OBJECT_ID", ""),
+                "MODIFICATION_DATE":    r.get("MODIFICATION_DATE", ""),
+                "CN_REF_PM_PT":         r.get("CN_REF_PM_PT", ""),
+                "CN_PROJECT_TYPE":      r.get("CN_PROJECT_TYPE", ""),
+                "TDMX_CUSTOMER":        r.get("TDMX_CUSTOMER", ""),
+                "TDMX_COMMENTS":        r.get("TDMX_COMMENTS", ""),
+                "CN_CLASSIFICATION":    r.get("CN_CLASSIFICATION", ""),
+                "CREATION_DATE":        r.get("CREATION_DATE", ""),
+                "TITLE":                r.get("TITLE", ""),
+                "DETAILS":              r.get("DETAILS", ""),
+                "LEVEL":                r.get("LEVEL", ""),
+                "PARENT_ID":            (r.get("PARENT_ID") or "").strip(),
+                "children":             [],
+            }
 
-        tdmx_id = _extract_tdmx(project_json)
+        # Link children to parents; roots are rows whose PARENT_ID is
+        # empty or not present among the nodes.
+        roots = []
+        for cid, node in proj_nodes.items():
+            pid = node["PARENT_ID"]
+            if pid and pid in proj_nodes:
+                proj_nodes[pid]["children"].append(node)
+            else:
+                roots.append(node)
+
+        # Derive TDMX_ID for filenames from the first root.
+        tdmx_id = roots[0].get("TDMX_ID") if roots else None
         stem = os.path.splitext(project_file)[0]
-
-        # Use TDMX_ID for filenames; fall back to the filename stem if
-        # the project JSON has no TDMX_ID. Sanitize for the filesystem.
+        # strip the "Projects_Tree_" prefix for a clean tag fallback
+        if stem.startswith("Projects_Tree_"):
+            stem = stem[len("Projects_Tree_"):]
         project_tag = sanitize_for_filename(tdmx_id) or stem
 
         start_project(project_tag)
 
+        # ==================================
+        # RESUME: load already-done paths for THIS project from prior
+        # runs' processed CSVs, and install them in the builder so files
+        # already uploaded are skipped. Folder skipping uses the same set.
+        # ==================================
+        done_paths = load_done_paths(project_tag) if resume else set()
+        set_resume_done(done_paths)
+
         log("\n================================")
         log(f"🚀 PROCESSING ({project_index}/{len(project_files)}):", project_file)
         log(f"   TDMX_ID: {tdmx_id} | file tag: {project_tag}")
+        log(f"   Project nodes: {len(proj_nodes)} | roots: {len(roots)}")
+        if resume:
+            log(f"   Resume: {len(done_paths)} paths already done (will skip)")
         log("================================")
 
-        log("\n📁 Project JSON:")
-        log(project_json_path)
-
-        log("\n📁 Document JSON:")
-        log(document_json_path)
-
-        log(
-            "\n📄 Project JSON Type:",
-            type(project_json)
-        )
-
         # ==================================
-        # CREATE PROJECT ROOT
+        # CREATE PROJECT ROOT (+ nested project folders)
         # ==================================
 
         project_root = None
 
-        if isinstance(project_json, list):
-
-            for project_node in project_json:
-
-                project_root = build_project_tree(
-                    project_node,
-                    sp,
-                    base
-                )
-                log_processed(
-                    project_node,
-                    node_type="PROJECT",
-                    status="Success",
-                    sharepoint_path=project_root or "",
-                    detail="Project root created",
-                )
-
-        elif isinstance(project_json, dict):
-
-            project_root = build_project_tree(
-                project_json,
-                sp,
-                base
-            )
+        for project_node in roots:
+            project_root = build_project_tree(project_node, sp, base)
             log_processed(
-                project_json,
+                project_node,
                 node_type="PROJECT",
                 status="Success",
                 sharepoint_path=project_root or "",
                 detail="Project root created",
             )
 
-        log(
-            "\n✅ Project Root:",
-            project_root
-        )
+        log("\n✅ Project Root:", project_root)
 
         # ==================================
-        # DOCUMENT FILE NOT FOUND
+        # READ DOCUMENTS_TREE CSV
+        # All document data comes from the CSV — not from JSON.
+        # The CSV is the authoritative, flat list of every
+        # document-parent relationship (all 7k+ rows), with all
+        # fields pre-populated by SmarTeam. Reading from CSV
+        # ensures no rows are missed due to JSON tree traversal
+        # constraints (visited-set skipping paths).
         # ==================================
 
-        if not os.path.exists(
-            document_json_path
-        ):
+        doc_csv_path = os.path.join(
+            DOCUMENT_CSV_FOLDER,
+            f"Documents_Tree_{project_tag}.csv"
+        ) if DOCUMENT_CSV_FOLDER else None
 
-            log(
-                "\n⚠️ No matching document file"
-            )
-
+        if not doc_csv_path or not os.path.exists(doc_csv_path):
+            log(f"\n⚠️ Documents_Tree CSV not found: {doc_csv_path}")
+            log("  Set DOCUMENT_CSV_FOLDER in .env to the folder containing Documents_Tree_*.csv files")
             continue
 
-        # ==================================
-        # READ DOCUMENT JSON
-        # ==================================
+        # Read all rows, split into folder vs file rows.
+        folder_rows = []
+        file_rows = []
 
-        with open(
-            document_json_path,
-            "r",
-            encoding="utf-8-sig"
-        ) as f:
+        with open(doc_csv_path, "r", encoding="utf-8-sig", newline="") as cf:
+            for row in csv.DictReader(cf):
+                if (row.get("ROOT_DIR_ON_SERVER") or "").strip():
+                    file_rows.append(row)
+                else:
+                    folder_rows.append(row)
 
-            document_json = json.load(f)
+        grand_total_folders += len(folder_rows)
+        grand_total_files += len(file_rows)
+        grand_total_docs += len(folder_rows) + len(file_rows)
 
-        log("\n================ DOCUMENT DEBUG ================")
-
-        log(
-            "Document JSON Type:",
-            type(document_json)
-        )
-
-        log("================================================\n")
-
-        # ==================================
-        # COUNT DOCUMENTS (TOTAL / FILES / FOLDERS)
-        # ==================================
-
-        proj_total, proj_files, proj_folders = count_document_json(
-            document_json
-        )
-
-        log("📊 DOCUMENT COUNTS for " + project_file + ":")
-        log(
-            f"   Total: {proj_total} | "
-            f"Files: {proj_files} | "
-            f"Folders: {proj_folders}"
-        )
-
-        grand_total_docs += proj_total
-        grand_total_files += proj_files
-        grand_total_folders += proj_folders
-
-        # ==================================
-        # SNAPSHOT COUNT BEFORE PROCESSING
-        # ==================================
+        log(f"\n📊 CSV rows for {project_file}:")
+        log(f"   FOLDER rows: {len(folder_rows)}")
+        log(f"   FILE rows:   {len(file_rows)}")
 
         processed_before = get_processed_count()
 
         # ==================================
-        # DOCUMENT JSON -> LIST
+        # CSV path → SharePoint path
+        # DocPath/UploadPath format: "ProjectName/seg/seg/.../name"
+        # The first segment is the SmarTeam project name; we replace it
+        # with project_root and translate the "previous_revision" marker
+        # to a "Previous_Revision" subfolder. SmarTeam already collapses
+        # file-assembly folders, so we trust the path as written.
         # ==================================
 
-        if isinstance(document_json, list):
-
-            for document_root in document_json:
-
-                documents = (
-                    document_root.get(
-                        "Documents",
-                        []
-                    )
-                )
-
-                log(
-                    "\n📂 Total Documents:",
-                    len(documents)
-                )
-
-                for document_node in documents:
-
-                    process(
-                        document_node,
-                        sp,
-                        project_root
-                    )
+        def csv_dir_to_sp(csv_path, drop_last=False, keep_prev=True):
+            parts = [p for p in csv_path.split("/") if p]
+            if drop_last and parts:
+                parts = parts[:-1]          # drop filename for UploadPath
+            seg = parts[1:]                 # drop SmarTeam project name
+            out = []
+            for p in seg:
+                if p.lower() == "previous_revision":
+                    if keep_prev:
+                        out.append("Previous_Revision")
+                    # else: skip — builder will add Previous_Revision once
+                else:
+                    out.append(sanitize(p))
+            return (project_root or "") + ("/" + "/".join(out) if out else "")
 
         # ==================================
-        # DOCUMENT JSON -> OBJECT
+        # HELPER: build node dict from CSV row
         # ==================================
 
-        elif isinstance(document_json, dict):
+        def make_node(row):
+            return {
+                "OBJECT_ID":                row.get("DocObjectId", ""),
+                "TDMX_ID":                  row.get("TDMX_ID", ""),
+                "Description":              row.get("Description", ""),
+                "FILE_NAME":                row.get("FILE_NAME", ""),
+                "CAD_REF_FILE_NAME":        row.get("CAD_REF_FILE_NAME", ""),
+                "ROOT_DIR_ON_SERVER":       row.get("ROOT_DIR_ON_SERVER", ""),
+                "REVISION":                 row.get("REVISION", ""),
+                "REVISION_STG":             row.get("REVISION_STG", ""),
+                "PAR_REVISION":             row.get("PAR_REVISION", ""),
+                "STATE":                    row.get("STATE", ""),
+                "TDM_FILE_ID":              row.get("TDM_FILE_ID", ""),
+                "VAULT_OBJECT_ID":          row.get("VAULT_OBJECT_ID", ""),
+                "FILE_SIZE":                row.get("FILE_SIZE", ""),
+                "FILE_SIZE_DISPLAY":        row.get("FILE_SIZE", ""),
+                "TDMX_CAD_IDENTIFIER":      row.get("TDMX_CAD_IDENTIFIER", ""),
+                "USER_OBJECT_ID":           row.get("USER_OBJECT_ID", ""),
+                "MODIFICATION_DATE":        row.get("MODIFICATION_DATE", ""),
+                "CREATION_DATE":            row.get("CREATION_DATE", ""),
+                "CN_DOCUMENT_APPLICABILITY":row.get("CN_DOCUMENT_APPLICABILITY", ""),
+                "TDMX_DETAILED_DESCRIPTION":row.get("TDMX_DETAILED_DESCRIPTION", ""),
+                "TDMX_COMMENTS":            row.get("TDMX_COMMENTS", ""),
+                "DESIGN_MODULE":            row.get("DESIGN_MODULE", ""),
+                "Path":                     row.get("DocPath", ""),
+                "UploadPath":               row.get("UploadPath", ""),
+                "ExtractTimestamp":         row.get("ExtractTimestamp", ""),
+                "Children":                 [],
+            }
 
-            documents = (
-                document_json.get(
-                    "Documents",
-                    []
-                )
-            )
+        # ==================================
+        # PASS 1: FOLDER CREATION + METADATA
+        # Only real folders (rows without ROOT_DIR_ON_SERVER) are
+        # created. SmarTeam already excluded file-assembly folders
+        # from the folder rows' DocPath collapse, so folder paths are
+        # taken straight from DocPath.
+        # ==================================
 
-            log(
-                "\n📂 Total Documents:",
-                len(documents)
-            )
+        log("\n📁 Pass 1: creating folders...")
+        folders_done = 0
 
-            for document_node in documents:
+        for row in folder_rows:
 
-                process(
-                    document_node,
-                    sp,
-                    project_root
-                )
+            doc_path = (row.get("DocPath") or "").strip()
+            if not doc_path:
+                continue
+
+            sp_path = csv_dir_to_sp(doc_path)
+            node = make_node(row)
+
+            # Resume: folder already created+metadata'd in a prior run
+            if resume and sp_path in done_paths:
+                log_processed(node, "FOLDER", "Skipped(Resume)", sp_path,
+                              "Already completed in a previous run (--resume)")
+                folders_done += 1
+                continue
+
+            folder_status = "Success"
+            folder_detail = "Folder created"
+
+            try:
+                sp.ensure_path(sp_path)
+            except Exception as e:
+                folder_status = "Failure"
+                folder_detail = f"ensure_path error: {e}"
+                log_failed(node, "FOLDER_CREATE", str(e), "FOLDER", sp_path)
+                log_processed(node, "FOLDER", folder_status, sp_path, folder_detail)
+                continue
+
+            # Apply folder metadata
+            try:
+                item = sp.get_item(sp_path)
+                if item:
+                    from metadata import build_metadata
+                    meta = build_metadata(node, "FOLDER")
+                    if meta:
+                        meta_res = sp.metadata(item["id"], meta)
+                        if not (meta_res and meta_res.get("success")):
+                            err = (meta_res or {}).get("error", "unknown")
+                            code = (meta_res or {}).get("status", "")
+                            folder_status = "Failure"
+                            folder_detail = f"Folder created but metadata failed (HTTP {code})"
+                            log_failed(node, "FOLDER_METADATA", str(err)[:300], "FOLDER", sp_path)
+            except Exception as e:
+                folder_status = "Failure"
+                folder_detail = f"Metadata error: {e}"
+                log_failed(node, "FOLDER_METADATA", str(e), "FOLDER", sp_path)
+
+            log_processed(node, "FOLDER", folder_status, sp_path, folder_detail)
+            folders_done += 1
+
+        log(f"✅ Folders done: {folders_done}")
+
+        # ==================================
+        # PASS 2: FILE UPLOADS
+        # SmarTeam's UploadPath is now authoritative (file-assembly
+        # paths already collapsed into the nearest real folder, and the
+        # previous_revision marker is in the path). We derive the parent
+        # folder by dropping the filename, then call process(). GraphAPI
+        # does NOT recompute paths — it trusts UploadPath.
+        # ==================================
+
+        log("\n📄 Pass 2: uploading files...")
+
+        for row in file_rows:
+
+            upload_path = (row.get("UploadPath") or "").strip()
+            if not upload_path:
+                continue
+
+            # Parent folder = UploadPath minus filename, WITHOUT the
+            # previous_revision marker — builder.process() re-adds the
+            # Previous_Revision subfolder once when it sees the marker in
+            # the node's UploadPath. This avoids doubling it.
+            parent_sp = csv_dir_to_sp(upload_path, drop_last=True, keep_prev=False)
+
+            node = make_node(row)
+
+            process(node, sp, parent_sp)
 
         # ==================================
         # PER-PROJECT SUMMARY
         # ==================================
 
-        processed_this_project = (
-            get_processed_count() - processed_before
-        )
+        processed_this_project = get_processed_count() - processed_before
 
         log(
             f"\n📦 PROJECT '{project_file}' DONE — "
-            f"{processed_this_project} files handled this project "
+            f"{processed_this_project} nodes handled "
             f"(running total: {get_processed_count()})"
         )
 
@@ -377,4 +452,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    resume_flag = "--resume" in sys.argv[1:]
+    main(resume=resume_flag)

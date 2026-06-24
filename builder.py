@@ -21,6 +21,23 @@ from logger import (
 INVALID_FOLDER_FILE = "invalid_folders.txt"
 
 # =========================================================
+# Resume support
+#
+# When the orchestrator runs with --resume, it loads the set of
+# SharePoint paths already completed by previous runs and calls
+# set_resume_done(...). process() then skips any file whose final
+# path is in this set, with no network call.
+# =========================================================
+
+_RESUME_DONE = set()
+
+
+def set_resume_done(done_paths):
+    """Install the set of already-completed SharePoint paths (resume)."""
+    global _RESUME_DONE
+    _RESUME_DONE = done_paths or set()
+
+# =========================================================
 # Duplicate handling
 #
 # Two file rows are "the same upload" when they resolve to the
@@ -175,12 +192,60 @@ def process(node, sp, parent):
         folder_status = "Success"
         folder_detail = ""
 
+        # try:
+        #     sp.ensure_path(current_path)
+        # except Exception as e:
+        #     folder_status = "Failure"
+        #     folder_detail = f"ensure_path error: {e}"
+        #     log("❌ Folder create error:", str(e))
+        #     log_failed(
+        #         node,
+        #         stage="FOLDER_CREATE",
+        #         reason=str(e),
+        #         node_type="FOLDER",
+        #         upload_path=current_path,
+        #     )
+
+        # =================================================
+        # Get SharePoint Folder Item
+        # =================================================
+
+        # try:
+        #     folder_res = requests.get(
+        #         f"https://graph.microsoft.com/v1.0/drives/{sp.drive_id}/root:/{current_path}",
+        #         headers=sp.get_headers()
+        #     )
+        # except Exception as e:
+        #     folder_res = None
+        #     folder_status = "Failure"
+        #     folder_detail = f"folder fetch error: {e}"
+        #     log("❌ Folder fetch exception:", str(e))
+        #     log_failed(
+        #         node,
+        #         stage="FOLDER_FETCH",
+        #         reason=str(e),
+        #         node_type="FOLDER",
+        #         upload_path=current_path,
+        #     )
+
+        folder_item = None
         try:
-            sp.ensure_path(current_path)
+
+            folder_item = sp.ensure_path(
+            current_path
+        )
+
         except Exception as e:
             folder_status = "Failure"
-            folder_detail = f"ensure_path error: {e}"
-            log("❌ Folder create error:", str(e))
+            folder_detail = (
+                f"ensure_path error: {e}"
+            )
+
+            log(
+                "❌ Folder create error:",
+                str(e)
+            )
+
             log_failed(
                 node,
                 stage="FOLDER_CREATE",
@@ -188,38 +253,76 @@ def process(node, sp, parent):
                 node_type="FOLDER",
                 upload_path=current_path,
             )
+        # if folder_res is not None and folder_res.status_code == 200:
 
-        # =================================================
-        # Get SharePoint Folder Item
-        # =================================================
+        #     folder_item = folder_res.json()
 
-        try:
-            folder_res = requests.get(
-                f"https://graph.microsoft.com/v1.0/drives/{sp.drive_id}/root:/{current_path}",
-                headers=sp.get_headers()
-            )
-        except Exception as e:
-            folder_res = None
-            folder_status = "Failure"
-            folder_detail = f"folder fetch error: {e}"
-            log("❌ Folder fetch exception:", str(e))
-            log_failed(
-                node,
-                stage="FOLDER_FETCH",
-                reason=str(e),
-                node_type="FOLDER",
-                upload_path=current_path,
-            )
+        #     folder_id = folder_item["id"]
 
-        if folder_res is not None and folder_res.status_code == 200:
+        #     # =============================================
+        #     # Apply Folder Metadata
+        #     # =============================================
 
-            folder_item = folder_res.json()
+        #     metadata = build_metadata(
+        #         node,
+        #         "FOLDER"
+        #     )
 
+        #     if metadata:
+
+        #         log("📝 Applying Folder Metadata")
+
+        #         try:
+        #             meta_res = sp.metadata(
+        #                 folder_id,
+        #                 metadata
+        #             )
+        #             if meta_res and meta_res.get("success"):
+        #                 log("✅ Folder Metadata Applied")
+        #             else:
+        #                 err = (meta_res or {}).get("error", "unknown metadata error")
+        #                 status_code = (meta_res or {}).get("status", "")
+        #                 folder_status = "Failure"
+        #                 folder_detail = (
+        #                     f"Folder created but metadata failed "
+        #                     f"(HTTP {status_code}): {str(err)[:200]}"
+        #                 )
+        #                 log("❌ Folder metadata FAILED:", folder_detail)
+        #                 log_failed(
+        #                     node,
+        #                     stage="FOLDER_METADATA",
+        #                     reason=f"Metadata failed (HTTP {status_code}): {str(err)[:300]}",
+        #                     node_type="FOLDER",
+        #                     upload_path=current_path,
+        #                 )
+        #         except Exception as e:
+        #             folder_status = "Failure"
+        #             folder_detail = f"metadata error: {e}"
+        #             log("❌ Folder metadata error:", str(e))
+        #             log_failed(
+        #                 node,
+        #                 stage="FOLDER_METADATA",
+        #                 reason=str(e),
+        #                 node_type="FOLDER",
+        #                 upload_path=current_path,
+        #             )
+
+        # elif folder_res is not None:
+
+        #     folder_status = "Failure"
+        #     folder_detail = f"fetch status {folder_res.status_code}"
+        #     log("❌ Failed to fetch folder")
+        #     log(folder_res.text)
+        #     log_failed(
+        #         node,
+        #         stage="FOLDER_FETCH",
+        #         reason=f"HTTP {folder_res.status_code}: {folder_res.text[:300]}",
+        #         node_type="FOLDER",
+        #         upload_path=current_path,
+        #     )
+        if folder_item:
+    
             folder_id = folder_item["id"]
-
-            # =============================================
-            # Apply Folder Metadata
-            # =============================================
 
             metadata = build_metadata(
                 node,
@@ -228,58 +331,72 @@ def process(node, sp, parent):
 
             if metadata:
 
-                log("📝 Applying Folder Metadata")
+                log(
+                    "📝 Applying Folder Metadata"
+                )
 
                 try:
+
                     meta_res = sp.metadata(
                         folder_id,
                         metadata
                     )
-                    if meta_res and meta_res.get("success"):
-                        log("✅ Folder Metadata Applied")
+
+                    if (
+                        meta_res
+                        and
+                        meta_res.get("success")
+                    ):
+
+                        log(
+                            "✅ Folder Metadata Applied"
+                        )
+
                     else:
-                        err = (meta_res or {}).get("error", "unknown metadata error")
-                        status_code = (meta_res or {}).get("status", "")
+
+                        err = (
+                            meta_res or {}
+                        ).get(
+                            "error",
+                            "unknown metadata error"
+                        )
+
+                        status_code = (
+                            meta_res or {}
+                        ).get(
+                            "status",
+                            ""
+                        )
+
                         folder_status = "Failure"
+
                         folder_detail = (
-                            f"Folder created but metadata failed "
-                            f"(HTTP {status_code}): {str(err)[:200]}"
+                            f"Folder created "
+                            f"but metadata failed "
+                            f"(HTTP {status_code}): "
+                            f"{str(err)[:200]}"
                         )
-                        log("❌ Folder metadata FAILED:", folder_detail)
-                        log_failed(
-                            node,
-                            stage="FOLDER_METADATA",
-                            reason=f"Metadata failed (HTTP {status_code}): {str(err)[:300]}",
-                            node_type="FOLDER",
-                            upload_path=current_path,
+
+                        log(
+                            "❌ Folder metadata FAILED:",
+                            folder_detail
                         )
+
                 except Exception as e:
+
                     folder_status = "Failure"
-                    folder_detail = f"metadata error: {e}"
-                    log("❌ Folder metadata error:", str(e))
-                    log_failed(
-                        node,
-                        stage="FOLDER_METADATA",
-                        reason=str(e),
-                        node_type="FOLDER",
-                        upload_path=current_path,
+
+                    folder_detail = (
+                        f"metadata error: {e}"
                     )
 
-        elif folder_res is not None:
-
-            folder_status = "Failure"
-            folder_detail = f"fetch status {folder_res.status_code}"
-            log("❌ Failed to fetch folder")
-            log(folder_res.text)
-            log_failed(
-                node,
-                stage="FOLDER_FETCH",
-                reason=f"HTTP {folder_res.status_code}: {folder_res.text[:300]}",
-                node_type="FOLDER",
-                upload_path=current_path,
-            )
-
+                    log(
+                        "❌ Folder metadata error:",
+                        str(e)
+                    )
         # Record the folder node in the per-project processed CSV
+        if folder_status == "Success" and not folder_detail:
+            folder_detail = "Folder created"
         log_processed(
             node,
             node_type="FOLDER",
@@ -468,6 +585,28 @@ def process(node, sp, parent):
 
         log("\n☁️ SharePoint Upload Path:")
         log(full_sharepoint_path)
+
+        # =================================================
+        # RESUME SKIP
+        # If --resume loaded a set of already-done paths and THIS file's
+        # final path is in it, it was uploaded (Success/Skipped) by a
+        # prior run — skip with no network call. This is the main
+        # time-saver after a crash.
+        # =================================================
+
+        if _RESUME_DONE and full_sharepoint_path in _RESUME_DONE:
+            log("\n⏭️ RESUME — already done in a previous run, skipping:")
+            log(full_sharepoint_path)
+            log_processed(
+                node,
+                node_type="FILE",
+                status="Skipped(Resume)",
+                sharepoint_path=full_sharepoint_path,
+                detail="Already completed in a previous run (--resume)",
+            )
+            count = increment_processed()
+            log(f"📈 Progress: {count} files processed so far")
+            return
 
         # =================================================
         # DUPLICATE SKIP (fallback)

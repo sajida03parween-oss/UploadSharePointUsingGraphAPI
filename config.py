@@ -15,6 +15,10 @@ LIBRARY_NAME = os.getenv("LIBRARY_NAME")
 PROJECT_FOLDER = os.getenv("PROJECT_FOLDER") 
 DOCUMENT_FOLDER = os.getenv("DOCUMENT_FOLDER")
 
+# Folder where Documents_Tree_<TDMX_ID>.csv files are stored.
+# Defaults to DOCUMENT_FOLDER if not set separately.
+DOCUMENT_CSV_FOLDER = os.getenv("DOCUMENT_CSV_FOLDER") or DOCUMENT_FOLDER
+
 OLD_ROOT = os.getenv("OLD_ROOT")
 NEW_ROOT = os.getenv("NEW_ROOT")
 

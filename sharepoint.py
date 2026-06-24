@@ -16,6 +16,9 @@ class SharePoint:
 
     def __init__(self):
         self.drive_id = None
+        self.session = requests.Session()
+        self.path_cache = {}
+        self.file_cache = {}
 
     def get_headers(self):
 
@@ -30,13 +33,20 @@ class SharePoint:
     # =====================================================
 
     def file_exists(self, sp_path):
-        encoded_path = quote(sp_path)
-        res = requests.get(
-            f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{sp_path}",
+    
+        if sp_path in self.file_cache:
+            return True
+
+        res = self.session.get(
+             f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{sp_path}",
             headers=self.get_headers()
         )
 
-        return res.status_code == 200
+        if res.status_code == 200:
+            self.file_cache[sp_path] = True
+            return True
+
+        return False
 
     # =====================================================
     # INIT
@@ -77,30 +87,36 @@ class SharePoint:
     # =====================================================
 
     def ensure_path(self, path):
+    
+        if path in self.path_cache:
+            return self.path_cache[path]
 
-        parts = path.split("/")
-
+        parts = [p for p in path.split("/") if p]
         current = ""
-
+        last_item = None
         for p in parts:
 
-            current = (
-                f"{current}/{p}"
-                if current else p
-            )
+            current = f"{current}/{p}" if current else p
+            if current in self.path_cache:
+                last_item = self.path_cache[current]
+                continue
 
-            res = requests.get(
+            res = self.session.get(
                 f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{current}",
                 headers=self.get_headers()
             )
 
-            if res.status_code == 404:
+            if res.status_code == 200:
+                last_item = res.json()
+                self.path_cache[current] = last_item
+                continue
 
+            if res.status_code == 404:
                 parent = "/".join(
                     current.split("/")[:-1]
                 )
 
-                create_res = requests.post(
+                create_res = self.session.post(
                     f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{parent}:/children",
                     headers={
                         **self.get_headers(),
@@ -108,14 +124,28 @@ class SharePoint:
                     },
                     json={
                         "name": p,
-                        "folder": {}
+                        "folder": {},
+                        "@microsoft.graph.conflictBehavior": "replace"
                     }
                 )
 
                 if create_res.status_code not in [200, 201]:
+                    raise Exception(
+                        f"Folder create failed: "
+                        f"{create_res.status_code} "
+                        f"{create_res.text}"
+                    )
 
-                    log("❌ Folder create failed")
-                    log(create_res.text)
+                last_item = create_res.json()
+                self.path_cache[current] = last_item
+                continue
+
+            raise Exception(
+                f"Unexpected Graph response "
+                f"{res.status_code}: {res.text}"
+            )
+
+        return last_item
 
     # =====================================================
     # MAIN UPLOAD ROUTER
@@ -438,9 +468,14 @@ class SharePoint:
             )
 
             if transient and attempt < retries:
+                # Honor Retry-After when SharePoint sends it (throttling)
+                try:
+                    wait = int(res.headers.get("Retry-After", retry_wait))
+                except (ValueError, TypeError):
+                    wait = retry_wait
                 log(f"🔁 Metadata transient {res.status_code} — retry "
-                    f"{attempt}/{retries} after {retry_wait}s...")
-                time.sleep(retry_wait)
+                    f"{attempt}/{retries} after {wait}s...")
+                time.sleep(wait)
                 continue
 
             # Non-transient, or out of retries
@@ -456,15 +491,22 @@ class SharePoint:
 # Get Path
 #------------------------------------------------
     def get_item(self, sp_path):
-        encoded_path = quote(sp_path)
-        res = requests.get(
+    
+        if sp_path in self.path_cache:
+            return self.path_cache[sp_path]
+
+        res = self.session.get(
             f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{sp_path}",
             headers=self.get_headers()
         )
 
         if res.status_code == 200:
-            return res.json()
+            item = res.json()
+            self.path_cache[sp_path] = item
+            return item
+
         log("❌ Get Item Failed")
         log(sp_path)
         log(res.text)
+
         return None
