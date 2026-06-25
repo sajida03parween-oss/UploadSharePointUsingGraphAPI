@@ -6,7 +6,7 @@ import csv
 from vault import get_file
 from utils import sanitize
 from metadata import get_type, build_metadata
-from config import FORCE_METADATA_UPDATE
+from config import FORCE_METADATA_UPDATE, SKIP_EXISTENCE_CHECK
 
 from logger import (
     log,
@@ -571,9 +571,62 @@ def process(node, sp, parent):
 
             log("\n📂 Creating Previous_Revision Folder")
 
-            sp.ensure_path(
-                target_folder
-            )
+            try:
+                sp.ensure_path(
+                    target_folder
+                )
+            except Exception as e:
+                log("❌ Previous_Revision folder ensure failed:", str(e))
+                log_failed(
+                    node,
+                    stage="FOLDER_ENSURE",
+                    reason=f"Previous_Revision ensure failed: {e}",
+                    node_type="FILE",
+                    upload_path=f"{target_folder}/{upload_name}",
+                )
+                log_processed(
+                    node,
+                    node_type="FILE",
+                    status="Failure",
+                    sharepoint_path=f"{target_folder}/{upload_name}",
+                    detail=f"Previous_Revision ensure failed: {e}",
+                )
+                count = increment_processed()
+                log(f"📈 Progress: {count} files processed so far")
+                return
+        else:
+            # Safety net: make sure the parent folder exists before
+            # uploading. Normally Pass 1 created it, but when running a
+            # trimmed/leftover tree the folder row may be absent — this
+            # guarantees the upload never lands in a missing folder.
+            # ensure_path is cached, so for already-known folders this is
+            # a no-op (no network call).
+            #
+            # Wrapped in try/except: a folder problem must become a normal
+            # logged Failure (recorded in BOTH processed and failed CSVs),
+            # NOT an exception that escapes process() and bypasses the
+            # processed-CSV row. Every node must appear in processed.csv.
+            try:
+                sp.ensure_path(target_folder)
+            except Exception as e:
+                log("❌ Parent folder ensure failed:", str(e))
+                log_failed(
+                    node,
+                    stage="FOLDER_ENSURE",
+                    reason=f"Parent folder ensure failed: {e}",
+                    node_type="FILE",
+                    upload_path=f"{target_folder}/{upload_name}",
+                )
+                log_processed(
+                    node,
+                    node_type="FILE",
+                    status="Failure",
+                    sharepoint_path=f"{target_folder}/{upload_name}",
+                    detail=f"Parent folder ensure failed: {e}",
+                )
+                count = increment_processed()
+                log(f"📈 Progress: {count} files processed so far")
+                return
 
         # =================================================
         # Final Upload Path
@@ -646,9 +699,15 @@ def process(node, sp, parent):
 
         # =================================================
         # SHAREPOINT EXISTENCE CHECK
+        #
+        # Skipped entirely when SKIP_EXISTENCE_CHECK is on (fresh upload
+        # into an empty destination) — saves one GET per file. In that
+        # mode every file goes straight to upload, and metadata is applied
+        # from the upload response (no extra GET). Resume still protects
+        # against re-doing already-uploaded files via the resume skip above.
         # =================================================
 
-        if sp.file_exists(full_sharepoint_path):
+        if not SKIP_EXISTENCE_CHECK and sp.file_exists(full_sharepoint_path):
 
             if FORCE_METADATA_UPDATE:
 

@@ -1,6 +1,7 @@
 import os
 import re
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from auth import get_token
 from sharepoint import SharePoint
@@ -16,6 +17,7 @@ from utils import sanitize
 from config import (
     PROJECT_FOLDER,
     DOCUMENT_CSV_FOLDER,
+    UPLOAD_WORKERS,
 )
 
 from logger import (
@@ -398,31 +400,53 @@ def main(resume=False):
         log(f"✅ Folders done: {folders_done}")
 
         # ==================================
-        # PASS 2: FILE UPLOADS
-        # SmarTeam's UploadPath is now authoritative (file-assembly
-        # paths already collapsed into the nearest real folder, and the
-        # previous_revision marker is in the path). We derive the parent
-        # folder by dropping the filename, then call process(). GraphAPI
-        # does NOT recompute paths — it trusts UploadPath.
+        # PASS 2: FILE UPLOADS (parallel)
+        # SmarTeam's UploadPath is authoritative (paths collapsed, prev-rev
+        # marker present). We derive the parent folder by dropping the
+        # filename, then call process() concurrently across UPLOAD_WORKERS
+        # threads. Uploads are I/O-bound (waiting on Graph), so threads give
+        # a large speedup. process() itself is unchanged; logging/counter/
+        # caches are thread-safe, and SharePoint throttling (429) is handled
+        # with Retry-After backoff inside the upload calls.
         # ==================================
 
-        log("\n📄 Pass 2: uploading files...")
+        log(f"\n📄 Pass 2: uploading files (workers={UPLOAD_WORKERS})...")
 
-        for row in file_rows:
-
+        def _handle_file(row):
             upload_path = (row.get("UploadPath") or "").strip()
             if not upload_path:
-                continue
-
+                return
             # Parent folder = UploadPath minus filename, WITHOUT the
             # previous_revision marker — builder.process() re-adds the
-            # Previous_Revision subfolder once when it sees the marker in
-            # the node's UploadPath. This avoids doubling it.
+            # Previous_Revision subfolder once when it sees the marker.
             parent_sp = csv_dir_to_sp(upload_path, drop_last=True, keep_prev=False)
-
             node = make_node(row)
+            try:
+                process(node, sp, parent_sp)
+            except Exception as e:
+                # A single file's failure must never kill the pool, and the
+                # node must STILL appear in processed.csv (with Failure) so
+                # the processed count always matches the Documents_Tree.
+                log(f"⚠️ Unhandled error processing "
+                    f"{row.get('DocObjectId','')}: {e}")
+                log_failed(node, "UPLOAD_UNHANDLED",
+                           str(e), "FILE", upload_path)
+                log_processed(node, "FILE", "Failure", upload_path,
+                              f"Unhandled error: {e}")
 
-            process(node, sp, parent_sp)
+        if UPLOAD_WORKERS <= 1:
+            # Sequential fallback (set UPLOAD_WORKERS=1 to disable threading)
+            for row in file_rows:
+                _handle_file(row)
+        else:
+            with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
+                futures = [pool.submit(_handle_file, row) for row in file_rows]
+                for fut in as_completed(futures):
+                    # Exceptions are already caught inside _handle_file;
+                    # this just surfaces anything truly unexpected.
+                    exc = fut.exception()
+                    if exc:
+                        log(f"⚠️ Worker raised: {exc}")
 
         # ==================================
         # PER-PROJECT SUMMARY

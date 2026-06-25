@@ -19,6 +19,9 @@ class SharePoint:
         self.session = requests.Session()
         self.path_cache = {}
         self.file_cache = {}
+        import threading
+        self._cache_lock = threading.Lock()
+        self._ensure_lock = threading.Lock()
 
     def get_headers(self):
 
@@ -87,65 +90,74 @@ class SharePoint:
     # =====================================================
 
     def ensure_path(self, path):
-    
+
         if path in self.path_cache:
             return self.path_cache[path]
 
-        parts = [p for p in path.split("/") if p]
-        current = ""
-        last_item = None
-        for p in parts:
+        # Serialize folder creation: concurrent uploads often target the
+        # same parent folder; without this, two threads could both try to
+        # create it. The cache check above is the fast path (no lock) for
+        # already-known folders; only first-time creation takes the lock.
+        with self._ensure_lock:
+            # Re-check inside the lock (another thread may have just made it)
+            if path in self.path_cache:
+                return self.path_cache[path]
 
-            current = f"{current}/{p}" if current else p
-            if current in self.path_cache:
-                last_item = self.path_cache[current]
-                continue
+            parts = [p for p in path.split("/") if p]
+            current = ""
+            last_item = None
+            for p in parts:
 
-            res = self.session.get(
-                f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{current}",
-                headers=self.get_headers()
-            )
+                current = f"{current}/{p}" if current else p
+                if current in self.path_cache:
+                    last_item = self.path_cache[current]
+                    continue
 
-            if res.status_code == 200:
-                last_item = res.json()
-                self.path_cache[current] = last_item
-                continue
-
-            if res.status_code == 404:
-                parent = "/".join(
-                    current.split("/")[:-1]
+                res = self.session.get(
+                    f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{current}",
+                    headers=self.get_headers()
                 )
 
-                create_res = self.session.post(
-                    f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{parent}:/children",
-                    headers={
-                        **self.get_headers(),
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "name": p,
-                        "folder": {},
-                        "@microsoft.graph.conflictBehavior": "replace"
-                    }
-                )
+                if res.status_code == 200:
+                    last_item = res.json()
+                    self.path_cache[current] = last_item
+                    continue
 
-                if create_res.status_code not in [200, 201]:
-                    raise Exception(
-                        f"Folder create failed: "
-                        f"{create_res.status_code} "
-                        f"{create_res.text}"
+                if res.status_code == 404:
+                    parent = "/".join(
+                        current.split("/")[:-1]
                     )
 
-                last_item = create_res.json()
-                self.path_cache[current] = last_item
-                continue
+                    create_res = self.session.post(
+                        f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{parent}:/children",
+                        headers={
+                            **self.get_headers(),
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "name": p,
+                            "folder": {},
+                            "@microsoft.graph.conflictBehavior": "replace"
+                        }
+                    )
 
-            raise Exception(
-                f"Unexpected Graph response "
-                f"{res.status_code}: {res.text}"
-            )
+                    if create_res.status_code not in [200, 201]:
+                        raise Exception(
+                            f"Folder create failed: "
+                            f"{create_res.status_code} "
+                            f"{create_res.text}"
+                        )
 
-        return last_item
+                    last_item = create_res.json()
+                    self.path_cache[current] = last_item
+                    continue
+
+                raise Exception(
+                    f"Unexpected Graph response "
+                    f"{res.status_code}: {res.text}"
+                )
+
+            return last_item
 
     # =====================================================
     # MAIN UPLOAD ROUTER
@@ -200,37 +212,56 @@ class SharePoint:
         log("\n📄 Local File:")
         log(local_path)
 
+        import time
+
         try:
 
-            with open(local_path, "rb") as f:
+            for attempt in range(1, 4):
 
-                res = requests.put(
-                    url,
-                    headers={
-                       **self.get_headers() ,
-                        "Content-Type": "application/octet-stream"
-                    },
-                    data=f,
-                    timeout=300
-                )
+                with open(local_path, "rb") as f:
 
-            log("📡 Upload Status:", res.status_code)
+                    res = requests.put(
+                        url,
+                        headers={
+                           **self.get_headers() ,
+                            "Content-Type": "application/octet-stream"
+                        },
+                        data=f,
+                        timeout=300
+                    )
 
-            if res.status_code not in [200, 201]:
+                log("📡 Upload Status:", res.status_code)
 
+                if res.status_code in [200, 201]:
+                    log("✅ Upload Success")
+                    return {
+                        "success": True,
+                        "data": res.json()
+                    }
+
+                # Throttled or transient server error → wait + retry
+                if (res.status_code == 429 or res.status_code >= 500) and attempt < 3:
+                    try:
+                        wait = int(res.headers.get("Retry-After", 10))
+                    except (ValueError, TypeError):
+                        wait = 10
+                    log(f"🔁 Upload throttled/transient {res.status_code} — "
+                        f"retry {attempt}/3 after {wait}s...")
+                    time.sleep(wait)
+                    continue
+
+                # Non-retryable failure
                 log("❌ Upload failed:")
                 log(res.text)
-
                 return {
                     "success": False,
                     "error": res.text
                 }
 
-            log("✅ Upload Success")
-
+            # Exhausted retries
             return {
-                "success": True,
-                "data": res.json()
+                "success": False,
+                "error": f"Upload failed after retries (HTTP {res.status_code})"
             }
 
         except Exception as e:
@@ -361,18 +392,23 @@ class SharePoint:
                     except Exception as e:
                         log("⚠️ Chunk Upload Error:")
                         log(str(e))
+                        chunk_res = None
 
                     # ============================================
                     # WAIT BEFORE RETRY
+                    # Honor Retry-After when present (throttling); else
+                    # use a shorter backoff than the old fixed 180s.
                     # ============================================
 
                     if attempt < 2:
-
-                        log(
-                            "⏳ Waiting 180 seconds before retry..."
-                        )
-
-                        time.sleep(180)
+                        wait = 30
+                        try:
+                            if chunk_res is not None:
+                                wait = int(chunk_res.headers.get("Retry-After", 30))
+                        except (ValueError, TypeError):
+                            wait = 30
+                        log(f"⏳ Waiting {wait}s before chunk retry...")
+                        time.sleep(wait)
 
                 # ================================================
                 # FINAL FAILURE

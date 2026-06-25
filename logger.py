@@ -19,6 +19,7 @@ FILE_ROTATE_LINES = 50_000     # Start a new log file every N lines
 # =========================================================
 
 _lock = threading.Lock()       # Protects _buffer and file-state vars
+_csv_lock = threading.Lock()   # Protects processed_/failed_ CSV appends
 
 _buffer = []                   # Pending formatted lines (not yet on disk)
 
@@ -314,7 +315,6 @@ def log_failed(node, stage, reason, node_type="", upload_path=""):
     """
     node = node or {}
     path = _failed_csv_path()
-    write_header = not os.path.exists(path)
 
     row = [
         _current_project_id or "",
@@ -331,11 +331,12 @@ def log_failed(node, stage, reason, node_type="", upload_path=""):
     try:
         if LOG_DIR and LOG_DIR not in (".", ""):
             os.makedirs(LOG_DIR, exist_ok=True)
-        with open(path, "a", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            if write_header:
-                w.writerow(_FAILED_HEADER)
-            w.writerow(row)
+        with _csv_lock:
+            with open(path, "a", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                if f.tell() == 0:
+                    w.writerow(_FAILED_HEADER)
+                w.writerow(row)
     except Exception as e:
         # Never let failure-logging crash the run
         log(f"⚠️ Could not write failed record: {e}")
@@ -396,7 +397,6 @@ def log_processed(node, node_type, status, sharepoint_path="", detail=""):
     """
     node = node or {}
     path = _processed_csv_path()
-    write_header = not os.path.exists(path)
 
     upload_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -446,12 +446,13 @@ def log_processed(node, node_type, status, sharepoint_path="", detail=""):
     try:
         if LOG_DIR and LOG_DIR not in (".", ""):
             os.makedirs(LOG_DIR, exist_ok=True)
-        with open(path, "a", newline="", encoding="utf-8-sig") as f:
-            # Semicolon-separated (instead of comma) per requirement
-            w = csv.writer(f, delimiter=";")
-            if write_header:
-                w.writerow(_PROCESSED_HEADER)
-            w.writerow(row)
+        with _csv_lock:
+            with open(path, "a", newline="", encoding="utf-8-sig") as f:
+                # Semicolon-separated (instead of comma) per requirement
+                w = csv.writer(f, delimiter=";")
+                if f.tell() == 0:   # header only when file is empty/new
+                    w.writerow(_PROCESSED_HEADER)
+                w.writerow(row)
     except Exception as e:
         log(f"⚠️ Could not write processed record: {e}")
 
@@ -546,15 +547,21 @@ def log_not_reached(csv_row):
 # Upload / processing counter
 # =========================================================
 
+_count_lock = threading.Lock()
+
+
 def increment_processed():
-    """Increment the global processed counter and return new value."""
+    """Increment the global processed counter and return new value.
+    Thread-safe for concurrent uploads."""
     global _processed_count
-    _processed_count += 1
-    return _processed_count
+    with _count_lock:
+        _processed_count += 1
+        return _processed_count
 
 
 def get_processed_count():
-    return _processed_count
+    with _count_lock:
+        return _processed_count
 
 
 def reset_processed_count():
