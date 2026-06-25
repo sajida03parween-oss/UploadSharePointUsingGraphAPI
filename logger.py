@@ -23,6 +23,13 @@ _csv_lock = threading.Lock()   # Protects processed_/failed_ CSV appends
 
 _buffer = []                   # Pending formatted lines (not yet on disk)
 
+# Per-thread log grouping. When a worker thread calls begin_file_log(),
+# its log() output collects into a thread-local list instead of being
+# interleaved with other threads. end_file_log() emits the whole block
+# atomically (console + file) so each file's lines stay together and the
+# log stays readable under many concurrent upload workers.
+_thread_local = threading.local()
+
 _current_log_file = None       # Path of the active log file
 _lines_in_current_file = 0     # How many lines already written to it
 
@@ -186,14 +193,21 @@ atexit.register(flush_logs)
 
 def log(*args, **kwargs):
     """
-    Print to console AND queue the line for the log file.
-    Lines are written to disk in batches of BUFFER_FLUSH_LINES
-    (default 100), and the log file rotates every FILE_ROTATE_LINES
-    (default 50,000) lines.
+    Queue a log line. Normally prints to console immediately and buffers
+    for the log file. BUT if the current thread has an active per-file
+    group (begin_file_log was called), the line is collected into that
+    thread-local block instead — so concurrent workers don't interleave.
+    The whole block is emitted atomically by end_file_log().
     """
 
     sep = kwargs.get("sep", " ")
     msg = sep.join(str(a) for a in args)
+
+    # If this thread is grouping its output, collect and return.
+    group = getattr(_thread_local, "group", None)
+    if group is not None:
+        group.append(msg)
+        return
 
     # 1) Print to console immediately (terminal output stays real-time)
     try:
@@ -206,6 +220,53 @@ def log(*args, **kwargs):
     lines = [f"[{ts}] {line}" for line in msg.split("\n")]
 
     # 3) Append to buffer; flush if we've hit the threshold
+    with _lock:
+        _buffer.extend(lines)
+        if len(_buffer) >= BUFFER_FLUSH_LINES:
+            _flush_locked()
+
+
+def begin_file_log():
+    """
+    Start collecting this thread's log output into one block. Use around a
+    single file's processing so its lines stay contiguous under concurrency.
+    Safe to call even if grouping is already active (nested calls are no-ops).
+    """
+    if getattr(_thread_local, "group", None) is None:
+        _thread_local.group = []
+
+
+def end_file_log():
+    """
+    Emit the thread's collected block atomically (console + log file) and
+    stop grouping. The whole block prints together and is written to the
+    buffer under one lock acquisition, so it never interleaves with other
+    threads' blocks.
+    """
+    group = getattr(_thread_local, "group", None)
+    if group is None:
+        return
+    _thread_local.group = None     # stop grouping first
+
+    if not group:
+        return
+
+    block_text = "\n".join(group)
+
+    # Console: print the whole block in one call, with a trailing blank
+    # line so adjacent blocks from other threads stay visually separated.
+    try:
+        print(block_text + "\n")
+    except Exception:
+        pass
+
+    # File: timestamp each source line, append under one lock
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = []
+    for msg in group:
+        for line in msg.split("\n"):
+            lines.append(f"[{ts}] {line}")
+
     with _lock:
         _buffer.extend(lines)
         if len(_buffer) >= BUFFER_FLUSH_LINES:
@@ -340,6 +401,82 @@ def log_failed(node, stage, reason, node_type="", upload_path=""):
     except Exception as e:
         # Never let failure-logging crash the run
         log(f"⚠️ Could not write failed record: {e}")
+
+
+# =========================================================
+# Per-project DUPLICATES CSV
+#
+# One file per run: duplicates_<projectId>_<runId>.csv
+# Records every node SKIPPED because its final SharePoint path was
+# already handled this run (same file, same folder). Same format family
+# as processed/failed: carries ProjectId, TDMX_ID and a timestamp.
+# =========================================================
+
+DUPLICATES_PREFIX = "duplicates"
+
+_DUPLICATES_HEADER = [
+    "ProjectId",
+    "TDMX_ID",
+    "OBJECT_ID",
+    "NodeType",
+    "Description",
+    "FILE_NAME",
+    "CADRefFileName",
+    "REVISION",
+    "REVISION_STG",
+    "FILE_SIZE",
+    "Path",
+    "UploadPath",        # the duplicate (already-seen) SharePoint path
+    "Reason",
+    "DuplicateTimestamp",  # when this duplicate was detected (local time)
+]
+
+
+def _duplicates_csv_path():
+    pid = _current_project_id or "unknown"
+    name = f"{DUPLICATES_PREFIX}_{pid}_{_RUN_ID}.csv"
+    return os.path.join(LOG_DIR, name) if LOG_DIR else name
+
+
+def log_duplicate(node, upload_path, node_type="FILE",
+                  reason="Duplicate upload path (same file, same folder)"):
+    """
+    Append a skipped-duplicate record to duplicates_<projectId>_<runId>.csv,
+    in the same format family as processed/failed (ProjectId, TDMX_ID,
+    timestamp). Thread-safe.
+    """
+    node = node or {}
+    path = _duplicates_csv_path()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    row = [
+        _current_project_id or "",
+        _node_tdmx_id(node),
+        _node_object_id(node),
+        node_type,
+        node.get("Description") or node.get("TDM_DESCRIPTION") or "",
+        node.get("FILE_NAME", ""),
+        node.get("CAD_REF_FILE_NAME", ""),
+        node.get("REVISION", ""),
+        node.get("REVISION_STG", ""),
+        node.get("FILE_SIZE", ""),
+        node.get("Path", ""),
+        upload_path or node.get("UploadPath", ""),
+        reason,
+        ts,
+    ]
+
+    try:
+        if LOG_DIR and LOG_DIR not in (".", ""):
+            os.makedirs(LOG_DIR, exist_ok=True)
+        with _csv_lock:
+            with open(path, "a", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                if f.tell() == 0:
+                    w.writerow(_DUPLICATES_HEADER)
+                w.writerow(row)
+    except Exception as e:
+        log(f"⚠️ Could not write duplicate record: {e}")
 
 
 # =========================================================

@@ -28,6 +28,8 @@ from logger import (
     log_processed,
     log_failed,
     load_done_paths,
+    begin_file_log,
+    end_file_log,
 )
 
 
@@ -96,7 +98,7 @@ def main(resume=False):
     # ROOT FOLDER
     # ======================================
 
-    base = "Testing_saj"
+    base = "Old_Test"
 
     sp.ensure_path(base)
 
@@ -421,6 +423,9 @@ def main(resume=False):
             # Previous_Revision subfolder once when it sees the marker.
             parent_sp = csv_dir_to_sp(upload_path, drop_last=True, keep_prev=False)
             node = make_node(row)
+            # Group all of THIS file's log lines into one contiguous block
+            # so concurrent workers don't interleave their output.
+            begin_file_log()
             try:
                 process(node, sp, parent_sp)
             except Exception as e:
@@ -433,6 +438,9 @@ def main(resume=False):
                            str(e), "FILE", upload_path)
                 log_processed(node, "FILE", "Failure", upload_path,
                               f"Unhandled error: {e}")
+            finally:
+                # Emit the whole block atomically, even on error.
+                end_file_log()
 
         if UPLOAD_WORKERS <= 1:
             # Sequential fallback (set UPLOAD_WORKERS=1 to disable threading)

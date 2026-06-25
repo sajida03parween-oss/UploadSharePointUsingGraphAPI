@@ -14,6 +14,7 @@ from logger import (
     get_processed_count,
     log_failed,
     log_processed,
+    log_duplicate,
 )
 
 # Folder-name problems are also recorded in the per-project failed CSV,
@@ -49,56 +50,8 @@ def set_resume_done(done_paths):
 # a different path and is therefore NOT a duplicate — it still uploads.
 # =========================================================
 
-DUPLICATES_FILE = "duplicates.csv"
-
 # In-memory set of upload paths already seen THIS run (case-insensitive)
 _seen_upload_paths = set()
-
-# Header written once, lazily, on the first duplicate
-_DUP_HEADER = [
-    "Reason",
-    "UploadPath",
-    "Description",
-    "FILE_NAME",
-    "CAD_REF_FILE_NAME",
-    "REVISION",
-    "REVISION_STG",
-    "TDM_FILE_ID",
-    "ROOT_DIR_ON_SERVER",
-    "FILE_SIZE",
-    "DESIGN_MODULE",
-    "Path",
-]
-
-
-def _dup_row(node, upload_path, reason="Duplicate upload path (same file, same folder)"):
-    return [
-        reason,
-        upload_path,
-        node.get("Description", ""),
-        node.get("FILE_NAME", ""),
-        node.get("CAD_REF_FILE_NAME", ""),
-        node.get("REVISION", ""),
-        node.get("REVISION_STG", ""),
-        node.get("TDM_FILE_ID", ""),
-        node.get("ROOT_DIR_ON_SERVER", ""),
-        node.get("FILE_SIZE", ""),
-        node.get("DESIGN_MODULE", ""),
-        node.get("Path", ""),
-    ]
-
-
-def log_duplicate(node, upload_path, reason="Duplicate upload path (same file, same folder)"):
-    """Append a skipped-duplicate record (full details) to duplicates.csv."""
-    write_header = not os.path.exists(DUPLICATES_FILE)
-    try:
-        with open(DUPLICATES_FILE, "a", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            if write_header:
-                w.writerow(_DUP_HEADER)
-            w.writerow(_dup_row(node, upload_path, reason))
-    except Exception as e:
-        log(f"⚠️ Could not write duplicate record: {e}")
 
 
 def is_duplicate_upload(upload_path):
