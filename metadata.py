@@ -1,3 +1,5 @@
+from logger import log
+
 def get_type(node, is_root=False):
     if is_root:
         return "PROJECT"
@@ -27,7 +29,7 @@ def build_metadata(node, node_type):
         smTitle = " | ".join(
             filter(None, [node.get("TDMX_CAD_IDENTIFIER"),node.get("Description")])
         )
-        print("FINAL smTitle:", smTitle)
+        log(f"FINAL smTitle: {smTitle}")
         return {
             "Title": smTitle,
             "_x0033_DX_Title": node.get("Description"),

@@ -102,22 +102,26 @@ class SharePoint:
             # Re-check inside the lock (another thread may have just made it)
             if path in self.path_cache:
                 return self.path_cache[path]
-
             parts = [p for p in path.split("/") if p]
+            
             current = ""
             last_item = None
             for p in parts:
 
                 current = f"{current}/{p}" if current else p
                 if current in self.path_cache:
+                    log(f"✅ Cache HIT : {current}")
                     last_item = self.path_cache[current]
                     continue
 
+                log(f"❌ Cache MISS : {current}")
+
+                url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{current}"
                 res = self.session.get(
-                    f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{current}",
+                    url,
                     headers=self.get_headers()
                 )
-
+                
                 if res.status_code == 200:
                     last_item = res.json()
                     self.path_cache[current] = last_item
@@ -127,21 +131,51 @@ class SharePoint:
                     parent = "/".join(
                         current.split("/")[:-1]
                     )
+                    
+                    post_url = (
+                        f"https://graph.microsoft.com/v1.0/drives/"
+                        f"{self.drive_id}/root:/{parent}:/children"
+                    )
+                    parent_item = self.get_item(parent)
 
+                    log(f"Parent Exists : {parent_item is not None}")
+
+                    if parent_item:
+                        log(f"Parent ID : {parent_item['id']}")
+                    else:
+                        log("Parent not found by Graph")
+                    parent_id = parent_item["id"]
+                    log(f"POST : {post_url}")
+                    payload = {
+                        "name": p,
+                        "folder": {},
+                        "@microsoft.graph.conflictBehavior": "replace"
+                    }
+
+                    post_url = (
+                        f"https://graph.microsoft.com/v1.0/drives/"
+                        f"{self.drive_id}/items/{parent_id}/children"
+                    )
+
+                    
                     create_res = self.session.post(
-                        f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{parent}:/children",
+                        post_url,
                         headers={
                             **self.get_headers(),
                             "Content-Type": "application/json"
                         },
-                        json={
-                            "name": p,
-                            "folder": {},
-                            "@microsoft.graph.conflictBehavior": "replace"
-                        }
+                        json=payload
                     )
-
+                    log(f"POST Status : {create_res.status_code}")
+                    log(f"POST Response: {create_res.text}")
                     if create_res.status_code not in [200, 201]:
+                        log("❌ Folder Creation Failed")
+                        log(f"Current Path : {current}")
+                        log(f"Parent       : {parent}")
+                        log(f"Folder Name  : {p}")
+                        log(f"Status       : {create_res.status_code}")
+                        log(f"Response     : {create_res.text}")
+
                         raise Exception(
                             f"Folder create failed: "
                             f"{create_res.status_code} "

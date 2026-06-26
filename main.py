@@ -7,7 +7,8 @@ from auth import get_token
 from sharepoint import SharePoint
 
 from project_builder import (
-    build_project_tree
+    build_project_tree,
+    PROJECT_NODES
 )
 
 from builder import process, set_resume_done
@@ -79,6 +80,11 @@ if DOCUMENT_CSV_FOLDER and os.path.exists(DOCUMENT_CSV_FOLDER):
 
 log("=======================================\n")
 
+# def walk_projects(node):
+#     yield node
+
+#     for child in node.get("children", []):
+#         yield from walk_projects(child)
 
 def main(resume=False):
 
@@ -98,7 +104,7 @@ def main(resume=False):
     # ROOT FOLDER
     # ======================================
 
-    base = "Old_Test"
+    base = "Testing_saj"
 
     sp.ensure_path(base)
 
@@ -201,25 +207,25 @@ def main(resume=False):
         # strip the "Projects_Tree_" prefix for a clean tag fallback
         if stem.startswith("Projects_Tree_"):
             stem = stem[len("Projects_Tree_"):]
-        project_tag = sanitize_for_filename(tdmx_id) or stem
+        #project_tag = sanitize_for_filename(tdmx_id) or stem
 
-        start_project(project_tag)
+        #start_project(project_tag)
 
         # ==================================
         # RESUME: load already-done paths for THIS project from prior
         # runs' processed CSVs, and install them in the builder so files
         # already uploaded are skipped. Folder skipping uses the same set.
         # ==================================
-        done_paths = load_done_paths(project_tag) if resume else set()
-        set_resume_done(done_paths)
+        #done_paths = load_done_paths(project_tag) if resume else set()
+        #set_resume_done(done_paths)
 
-        log("\n================================")
-        log(f"🚀 PROCESSING ({project_index}/{len(project_files)}):", project_file)
-        log(f"   TDMX_ID: {tdmx_id} | file tag: {project_tag}")
-        log(f"   Project nodes: {len(proj_nodes)} | roots: {len(roots)}")
-        if resume:
-            log(f"   Resume: {len(done_paths)} paths already done (will skip)")
-        log("================================")
+        # log("\n================================")
+        # log(f"🚀 PROCESSING ({project_index}/{len(project_files)}):", project_file)
+        # log(f"   TDMX_ID: {tdmx_id} | file tag: {project_tag}")
+        # log(f"   Project nodes: {len(proj_nodes)} | roots: {len(roots)}")
+        # if resume:
+        #     log(f"   Resume: {len(done_paths)} paths already done (will skip)")
+        # log("================================")
 
         # ==================================
         # CREATE PROJECT ROOT (+ nested project folders)
@@ -237,6 +243,7 @@ def main(resume=False):
                 detail="Project root created",
             )
 
+
         log("\n✅ Project Root:", project_root)
 
         # ==================================
@@ -248,239 +255,282 @@ def main(resume=False):
         # ensures no rows are missed due to JSON tree traversal
         # constraints (visited-set skipping paths).
         # ==================================
+    
+        for project_id, info in PROJECT_NODES.items():
+            project = info["node"]
+            project_tag = project["TDMX_ID"]
+            project_root = project["SP_PATH"]
+             # ADD THESE TWO LINES
+            start_project(project_tag)
+            # ==================================
+            # RESUME: load already-done paths for THIS project from prior
+            # runs' processed CSVs, and install them in the builder so files
+            # already uploaded are skipped. Folder skipping uses the same set.
+            # ==================================
+            done_paths = load_done_paths(project_tag) if resume else set()
+            set_resume_done(done_paths)
+            log("\n================================")
+            log(f"🚀 PROCESSING ({project_index}/{len(project_files)}):", project_file)
+            log(f"   TDMX_ID: {tdmx_id} | file tag: {project_tag}")
+            log(f"   Project nodes: {len(proj_nodes)} | roots: {len(roots)}")
+            if resume:
+                log(f"   Resume: {len(done_paths)} paths already done (will skip)")
+            log("================================")
+            doc_csv_path = os.path.join(
+                DOCUMENT_CSV_FOLDER,
+                f"Documents_Tree_{project_tag}.csv"
+            ) if DOCUMENT_CSV_FOLDER else None
+            
+            doc_csv_name = os.path.basename(doc_csv_path)
 
-        doc_csv_path = os.path.join(
-            DOCUMENT_CSV_FOLDER,
-            f"Documents_Tree_{project_tag}.csv"
-        ) if DOCUMENT_CSV_FOLDER else None
-
-        if not doc_csv_path or not os.path.exists(doc_csv_path):
-            log(f"\n⚠️ Documents_Tree CSV not found: {doc_csv_path}")
-            log("  Set DOCUMENT_CSV_FOLDER in .env to the folder containing Documents_Tree_*.csv files")
-            continue
-
-        # Read all rows, split into folder vs file rows.
-        folder_rows = []
-        file_rows = []
-
-        with open(doc_csv_path, "r", encoding="utf-8-sig", newline="") as cf:
-            for row in csv.DictReader(cf):
-                if (row.get("ROOT_DIR_ON_SERVER") or "").strip():
-                    file_rows.append(row)
-                else:
-                    folder_rows.append(row)
-
-        grand_total_folders += len(folder_rows)
-        grand_total_files += len(file_rows)
-        grand_total_docs += len(folder_rows) + len(file_rows)
-
-        log(f"\n📊 CSV rows for {project_file}:")
-        log(f"   FOLDER rows: {len(folder_rows)}")
-        log(f"   FILE rows:   {len(file_rows)}")
-
-        processed_before = get_processed_count()
-
-        # ==================================
-        # CSV path → SharePoint path
-        # DocPath/UploadPath format: "ProjectName/seg/seg/.../name"
-        # The first segment is the SmarTeam project name; we replace it
-        # with project_root and translate the "previous_revision" marker
-        # to a "Previous_Revision" subfolder. SmarTeam already collapses
-        # file-assembly folders, so we trust the path as written.
-        # ==================================
-
-        def csv_dir_to_sp(csv_path, drop_last=False, keep_prev=True):
-            parts = [p for p in csv_path.split("/") if p]
-            if drop_last and parts:
-                parts = parts[:-1]          # drop filename for UploadPath
-            seg = parts[1:]                 # drop SmarTeam project name
-            out = []
-            for p in seg:
-                if p.lower() == "previous_revision":
-                    if keep_prev:
-                        out.append("Previous_Revision")
-                    # else: skip — builder will add Previous_Revision once
-                else:
-                    out.append(sanitize(p))
-            return (project_root or "") + ("/" + "/".join(out) if out else "")
-
-        # ==================================
-        # HELPER: build node dict from CSV row
-        # ==================================
-
-        def make_node(row):
-            return {
-                "OBJECT_ID":                row.get("DocObjectId", ""),
-                "TDMX_ID":                  row.get("TDMX_ID", ""),
-                "Description":              row.get("Description", ""),
-                "FILE_NAME":                row.get("FILE_NAME", ""),
-                "CAD_REF_FILE_NAME":        row.get("CAD_REF_FILE_NAME", ""),
-                "ROOT_DIR_ON_SERVER":       row.get("ROOT_DIR_ON_SERVER", ""),
-                "REVISION":                 row.get("REVISION", ""),
-                "REVISION_STG":             row.get("REVISION_STG", ""),
-                "PAR_REVISION":             row.get("PAR_REVISION", ""),
-                "STATE":                    row.get("STATE", ""),
-                "TDM_FILE_ID":              row.get("TDM_FILE_ID", ""),
-                "VAULT_OBJECT_ID":          row.get("VAULT_OBJECT_ID", ""),
-                "FILE_SIZE":                row.get("FILE_SIZE", ""),
-                "FILE_SIZE_DISPLAY":        row.get("FILE_SIZE", ""),
-                "TDMX_CAD_IDENTIFIER":      row.get("TDMX_CAD_IDENTIFIER", ""),
-                "USER_OBJECT_ID":           row.get("USER_OBJECT_ID", ""),
-                "MODIFICATION_DATE":        row.get("MODIFICATION_DATE", ""),
-                "CREATION_DATE":            row.get("CREATION_DATE", ""),
-                "CN_DOCUMENT_APPLICABILITY":row.get("CN_DOCUMENT_APPLICABILITY", ""),
-                "TDMX_DETAILED_DESCRIPTION":row.get("TDMX_DETAILED_DESCRIPTION", ""),
-                "TDMX_COMMENTS":            row.get("TDMX_COMMENTS", ""),
-                "DESIGN_MODULE":            row.get("DESIGN_MODULE", ""),
-                "Path":                     row.get("DocPath", ""),
-                "UploadPath":               row.get("UploadPath", ""),
-                "ExtractTimestamp":         row.get("ExtractTimestamp", ""),
-                "Children":                 [],
-            }
-
-        # ==================================
-        # PASS 1: FOLDER CREATION + METADATA
-        # Only real folders (rows without ROOT_DIR_ON_SERVER) are
-        # created. SmarTeam already excluded file-assembly folders
-        # from the folder rows' DocPath collapse, so folder paths are
-        # taken straight from DocPath.
-        # ==================================
-
-        log("\n📁 Pass 1: creating folders...")
-        folders_done = 0
-
-        for row in folder_rows:
-
-            doc_path = (row.get("DocPath") or "").strip()
-            if not doc_path:
+            if not doc_csv_path or not os.path.exists(doc_csv_path):
+                log(f"\n⚠️ Documents_Tree CSV not found: {doc_csv_path}")
+                log("  Set DOCUMENT_CSV_FOLDER in .env to the folder containing Documents_Tree_*.csv files")
                 continue
 
-            sp_path = csv_dir_to_sp(doc_path)
-            node = make_node(row)
+            # Read all rows, split into folder vs file rows.
+            folder_rows = []
+            file_rows = []
 
-            # Resume: folder already created+metadata'd in a prior run
-            if resume and sp_path in done_paths:
-                log_processed(node, "FOLDER", "Skipped(Resume)", sp_path,
-                              "Already completed in a previous run (--resume)")
-                folders_done += 1
-                continue
+            with open(doc_csv_path, "r", encoding="utf-8-sig", newline="") as cf:
+                for row in csv.DictReader(cf):
+                    if (row.get("ROOT_DIR_ON_SERVER") or "").strip():
+                        file_rows.append(row)
+                    else:
+                        folder_rows.append(row)
 
-            folder_status = "Success"
-            folder_detail = "Folder created"
+            grand_total_folders += len(folder_rows)
+            grand_total_files += len(file_rows)
+            grand_total_docs += len(folder_rows) + len(file_rows)
 
-            try:
-                sp.ensure_path(sp_path)
-            except Exception as e:
-                folder_status = "Failure"
-                folder_detail = f"ensure_path error: {e}"
-                log_failed(node, "FOLDER_CREATE", str(e), "FOLDER", sp_path)
+            log(f"\n📊 CSV rows for {project_file}:")
+            log(f"\n📄 Processing Document CSV: {doc_csv_name}")
+            log(f"   FOLDER rows: {len(folder_rows)}")
+            log(f"   FILE rows:   {len(file_rows)}")
+
+            processed_before = get_processed_count()
+
+            # ==================================
+            # CSV path → SharePoint path
+            # DocPath/UploadPath format: "ProjectName/seg/seg/.../name"
+            # The first segment is the SmarTeam project name; we replace it
+            # with project_root and translate the "previous_revision" marker
+            # to a "Previous_Revision" subfolder. SmarTeam already collapses
+            # file-assembly folders, so we trust the path as written.
+            # ==================================
+
+            def csv_dir_to_sp(csv_path, drop_last=False, keep_prev=True):
+                parts = [p for p in csv_path.split("/") if p]
+                
+                if drop_last and parts:
+                    parts = parts[:-1]          # drop filename for UploadPath
+                seg = parts[1:]                 # drop SmarTeam project name
+                out = []
+                for p in seg:
+                    if p.lower() == "previous_revision":
+                        if keep_prev:
+                            out.append("Previous_Revision")
+                        # else: skip — builder will add Previous_Revision once
+                    else:
+                        out.append(sanitize(p))
+                return (project_root or "") + ("/" + "/".join(out) if out else "")
+
+            # ==================================
+            # HELPER: build node dict from CSV row
+            # ==================================
+
+            def make_node(row):
+                return {
+                    "OBJECT_ID":                row.get("DocObjectId", ""),
+                    "TDMX_ID":                  row.get("TDMX_ID", ""),
+                    "Description":              row.get("Description", ""),
+                    "FILE_NAME":                row.get("FILE_NAME", ""),
+                    "CAD_REF_FILE_NAME":        row.get("CAD_REF_FILE_NAME", ""),
+                    "ROOT_DIR_ON_SERVER":       row.get("ROOT_DIR_ON_SERVER", ""),
+                    "REVISION":                 row.get("REVISION", ""),
+                    "REVISION_STG":             row.get("REVISION_STG", ""),
+                    "PAR_REVISION":             row.get("PAR_REVISION", ""),
+                    "STATE":                    row.get("STATE", ""),
+                    "TDM_FILE_ID":              row.get("TDM_FILE_ID", ""),
+                    "VAULT_OBJECT_ID":          row.get("VAULT_OBJECT_ID", ""),
+                    "FILE_SIZE":                row.get("FILE_SIZE", ""),
+                    "FILE_SIZE_DISPLAY":        row.get("FILE_SIZE", ""),
+                    "TDMX_CAD_IDENTIFIER":      row.get("TDMX_CAD_IDENTIFIER", ""),
+                    "USER_OBJECT_ID":           row.get("USER_OBJECT_ID", ""),
+                    "MODIFICATION_DATE":        row.get("MODIFICATION_DATE", ""),
+                    "CREATION_DATE":            row.get("CREATION_DATE", ""),
+                    "CN_DOCUMENT_APPLICABILITY":row.get("CN_DOCUMENT_APPLICABILITY", ""),
+                    "TDMX_DETAILED_DESCRIPTION":row.get("TDMX_DETAILED_DESCRIPTION", ""),
+                    "TDMX_COMMENTS":            row.get("TDMX_COMMENTS", ""),
+                    "DESIGN_MODULE":            row.get("DESIGN_MODULE", ""),
+                    "Path":                     row.get("DocPath", ""),
+                    "UploadPath":               row.get("UploadPath", ""),
+                    "ExtractTimestamp":         row.get("ExtractTimestamp", ""),
+                    "Children":                 [],
+                }
+
+            # ==================================
+            # PASS 1: FOLDER CREATION + METADATA
+            # Only real folders (rows without ROOT_DIR_ON_SERVER) are
+            # created. SmarTeam already excluded file-assembly folders
+            # from the folder rows' DocPath collapse, so folder paths are
+            # taken straight from DocPath.
+            # ==================================
+
+            log("\n📁 Pass 1: creating folders...")
+            folders_done = 0
+
+            for row in folder_rows:
+
+                doc_path = (row.get("DocPath") or "").strip()
+                if not doc_path:
+                    continue
+                log("=" * 100)
+                log(f"Project Tag  : {project_tag}")
+                log(f"Project Root : {project_root}")
+                log(f"Doc Path     : {doc_path}")
+                sp_path = csv_dir_to_sp(doc_path)
+                log(f"Final SP Path: {sp_path}")
+                node = make_node(row)
+
+                # Resume: folder already created+metadata'd in a prior run
+                if resume and sp_path in done_paths:
+                    log_processed(node, "FOLDER", "Skipped(Resume)", sp_path,
+                                "Already completed in a previous run (--resume)")
+                    folders_done += 1
+                    continue
+
+                folder_status = "Success"
+                folder_detail = "Folder created"
+
+                try:
+                    log("=" * 100)
+                    log(f"Project TDMX_ID : {project_tag}")
+                    log(f"Project Root    : {project_root}")
+                    log(f"DocPath         : {doc_path}")
+                    log(f"SharePoint Path : {sp_path}")
+                    log("Calling sp.ensure_path()...")
+
+                    sp.ensure_path(sp_path)
+                    log("Folder created successfully.")
+                except Exception as e:
+                    folder_status = "Failure"
+                    folder_detail = f"ensure_path error: {e}"
+                    log_failed(node, "FOLDER_CREATE", str(e), "FOLDER", sp_path)
+                    log_processed(node, "FOLDER", folder_status, sp_path, folder_detail)
+                    continue
+
+                # Apply folder metadata
+                try:
+                    item = sp.get_item(sp_path)
+                    if item:
+                        from metadata import build_metadata
+                        meta = build_metadata(node, "FOLDER")
+                        if meta:
+                            meta_res = sp.metadata(item["id"], meta)
+                            if not (meta_res and meta_res.get("success")):
+                                err = (meta_res or {}).get("error", "unknown")
+                                code = (meta_res or {}).get("status", "")
+                                folder_status = "Failure"
+                                folder_detail = f"Folder created but metadata failed (HTTP {code})"
+                                log_failed(node, "FOLDER_METADATA", str(err)[:300], "FOLDER", sp_path)
+                except Exception as e:
+                    folder_status = "Failure"
+                    folder_detail = f"Metadata error: {e}"
+                    log_failed(node, "FOLDER_METADATA", str(e), "FOLDER", sp_path)
+
                 log_processed(node, "FOLDER", folder_status, sp_path, folder_detail)
-                continue
+                folders_done += 1
 
-            # Apply folder metadata
-            try:
-                item = sp.get_item(sp_path)
-                if item:
-                    from metadata import build_metadata
-                    meta = build_metadata(node, "FOLDER")
-                    if meta:
-                        meta_res = sp.metadata(item["id"], meta)
-                        if not (meta_res and meta_res.get("success")):
-                            err = (meta_res or {}).get("error", "unknown")
-                            code = (meta_res or {}).get("status", "")
-                            folder_status = "Failure"
-                            folder_detail = f"Folder created but metadata failed (HTTP {code})"
-                            log_failed(node, "FOLDER_METADATA", str(err)[:300], "FOLDER", sp_path)
-            except Exception as e:
-                folder_status = "Failure"
-                folder_detail = f"Metadata error: {e}"
-                log_failed(node, "FOLDER_METADATA", str(e), "FOLDER", sp_path)
+            log(f"✅ Folders done: {folders_done}")
 
-            log_processed(node, "FOLDER", folder_status, sp_path, folder_detail)
-            folders_done += 1
+            # ==================================
+            # PASS 2: FILE UPLOADS (parallel)
+            # SmarTeam's UploadPath is authoritative (paths collapsed, prev-rev
+            # marker present). We derive the parent folder by dropping the
+            # filename, then call process() concurrently across UPLOAD_WORKERS
+            # threads. Uploads are I/O-bound (waiting on Graph), so threads give
+            # a large speedup. process() itself is unchanged; logging/counter/
+            # caches are thread-safe, and SharePoint throttling (429) is handled
+            # with Retry-After backoff inside the upload calls.
+            # ==================================
 
-        log(f"✅ Folders done: {folders_done}")
+            log(f"\n📄 Pass 2: uploading files (workers={UPLOAD_WORKERS})...")
 
-        # ==================================
-        # PASS 2: FILE UPLOADS (parallel)
-        # SmarTeam's UploadPath is authoritative (paths collapsed, prev-rev
-        # marker present). We derive the parent folder by dropping the
-        # filename, then call process() concurrently across UPLOAD_WORKERS
-        # threads. Uploads are I/O-bound (waiting on Graph), so threads give
-        # a large speedup. process() itself is unchanged; logging/counter/
-        # caches are thread-safe, and SharePoint throttling (429) is handled
-        # with Retry-After backoff inside the upload calls.
-        # ==================================
+            def _handle_file(row):
+                upload_path = (row.get("UploadPath") or "").strip()
+                if not upload_path:
+                    return
+                # Parent folder = UploadPath minus filename, WITHOUT the
+                # previous_revision marker — builder.process() re-adds the
+                # Previous_Revision subfolder once when it sees the marker.
+                parent_sp = csv_dir_to_sp(upload_path, drop_last=True, keep_prev=False)
+                node = make_node(row)
+                # Group all of THIS file's log lines into one contiguous block
+                # so concurrent workers don't interleave their output.
+                begin_file_log()
+                try:
+                    process(node, sp, parent_sp)
+                except Exception as e:
+                    # A single file's failure must never kill the pool, and the
+                    # node must STILL appear in processed.csv (with Failure) so
+                    # the processed count always matches the Documents_Tree.
+                    log(f"⚠️ Unhandled error processing "
+                        f"{row.get('DocObjectId','')}: {e}")
+                    log_failed(node, "UPLOAD_UNHANDLED",
+                            str(e), "FILE", upload_path)
+                    log_processed(node, "FILE", "Failure", upload_path,
+                                f"Unhandled error: {e}")
+                finally:
+                    # Emit the whole block atomically, even on error.
+                    end_file_log()
 
-        log(f"\n📄 Pass 2: uploading files (workers={UPLOAD_WORKERS})...")
+            if UPLOAD_WORKERS <= 1:
+                # Sequential fallback (set UPLOAD_WORKERS=1 to disable threading)
+                for row in file_rows:
+                    _handle_file(row)
+            else:
+                with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
+                    futures = [pool.submit(_handle_file, row) for row in file_rows]
+                    for fut in as_completed(futures):
+                        # Exceptions are already caught inside _handle_file;
+                        # this just surfaces anything truly unexpected.
+                        exc = fut.exception()
+                        if exc:
+                            log(f"⚠️ Worker raised: {exc}")
 
-        def _handle_file(row):
-            upload_path = (row.get("UploadPath") or "").strip()
-            if not upload_path:
-                return
-            # Parent folder = UploadPath minus filename, WITHOUT the
-            # previous_revision marker — builder.process() re-adds the
-            # Previous_Revision subfolder once when it sees the marker.
-            parent_sp = csv_dir_to_sp(upload_path, drop_last=True, keep_prev=False)
-            node = make_node(row)
-            # Group all of THIS file's log lines into one contiguous block
-            # so concurrent workers don't interleave their output.
-            begin_file_log()
-            try:
-                process(node, sp, parent_sp)
-            except Exception as e:
-                # A single file's failure must never kill the pool, and the
-                # node must STILL appear in processed.csv (with Failure) so
-                # the processed count always matches the Documents_Tree.
-                log(f"⚠️ Unhandled error processing "
-                    f"{row.get('DocObjectId','')}: {e}")
-                log_failed(node, "UPLOAD_UNHANDLED",
-                           str(e), "FILE", upload_path)
-                log_processed(node, "FILE", "Failure", upload_path,
-                              f"Unhandled error: {e}")
-            finally:
-                # Emit the whole block atomically, even on error.
-                end_file_log()
+            # ==================================
+            # PER-PROJECT SUMMARY
+            # ==================================
 
-        if UPLOAD_WORKERS <= 1:
-            # Sequential fallback (set UPLOAD_WORKERS=1 to disable threading)
-            for row in file_rows:
-                _handle_file(row)
-        else:
-            with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
-                futures = [pool.submit(_handle_file, row) for row in file_rows]
-                for fut in as_completed(futures):
-                    # Exceptions are already caught inside _handle_file;
-                    # this just surfaces anything truly unexpected.
-                    exc = fut.exception()
-                    if exc:
-                        log(f"⚠️ Worker raised: {exc}")
+            processed_this_project = get_processed_count() - processed_before
 
-        # ==================================
-        # PER-PROJECT SUMMARY
-        # ==================================
+            log(
+                f"\n📦 PROJECT '{project_file}' DONE — "
+                f"{processed_this_project} nodes handled "
+                f"(running total: {get_processed_count()})"
+            )
+            log("\n=========== PROJECT SUMMARY ===========")
+            log(f"📁 Project       : {project_tag}")
+            log(f"📂 Path          : {project_root}")
+            log(f"📊 Folder Rows   : {len(folder_rows)}")
+            log(f"📊 File Rows     : {len(file_rows)}")
+            log(f"📊 Processed     : {processed_this_project}")
+            log("======================================")
 
-        processed_this_project = get_processed_count() - processed_before
+        # ======================================
+        # FINAL SUMMARY
+        # ======================================
 
-        log(
-            f"\n📦 PROJECT '{project_file}' DONE — "
-            f"{processed_this_project} nodes handled "
-            f"(running total: {get_processed_count()})"
-        )
+        log("\n=========== FINAL SUMMARY ===========")
+        log(f"📊 Projects processed:   {len(project_files)}")
+        log(f"📊 Grand total nodes:    {grand_total_docs}")
+        log(f"📊 Grand total FILES:    {grand_total_files}")
+        log(f"📊 Grand total FOLDERS:  {grand_total_folders}")
+        log(f"📊 Files handled (run):  {get_processed_count()}")
+        log("=====================================")
 
-    # ======================================
-    # FINAL SUMMARY
-    # ======================================
-
-    log("\n=========== FINAL SUMMARY ===========")
-    log(f"📊 Projects processed:   {len(project_files)}")
-    log(f"📊 Grand total nodes:    {grand_total_docs}")
-    log(f"📊 Grand total FILES:    {grand_total_files}")
-    log(f"📊 Grand total FOLDERS:  {grand_total_folders}")
-    log(f"📊 Files handled (run):  {get_processed_count()}")
-    log("=====================================")
-
-    log("\n✅ Migration Complete")
+        log("\n✅ Migration Complete")
 
 
 if __name__ == "__main__":

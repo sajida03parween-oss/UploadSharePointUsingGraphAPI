@@ -6,6 +6,7 @@ from utils import sanitize
 from metadata import build_metadata
 from logger import log
 
+PROJECT_NODES = {}
 
 def build_project_tree(
     node,
@@ -34,6 +35,14 @@ def build_project_tree(
     current_path = (
         f"{parent}/{project_name}"
     )
+
+    # Save the SharePoint path inside the node
+    node["SP_PATH"] = current_path
+
+    PROJECT_NODES[node["TDMX_ID"]] = {
+        "path": current_path,
+        "node": node
+    }
 
     log("\n📁 PROJECT:", current_path)
 
