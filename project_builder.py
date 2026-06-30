@@ -54,16 +54,15 @@ def build_project_tree(
 
     # ==========================================
     # Get SharePoint Item
+    # Use sp.get_item (which percent-encodes the path) instead of a raw
+    # request, so project names containing # + & don't truncate the URL.
     # ==========================================
 
-    res = requests.get(
-        f"https://graph.microsoft.com/v1.0/drives/{sp.drive_id}/root:/{current_path}",
-        headers=sp.get_headers()
-    )
+    item = sp.get_item(current_path)
 
-    if res.status_code == 200:
+    if item:
 
-        folder_id = res.json()["id"]
+        folder_id = item["id"]
 
         metadata = build_metadata(
             node,

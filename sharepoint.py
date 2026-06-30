@@ -1,8 +1,6 @@
-from email.quoprimime import quote
 import os
-import token
 import requests
-from requests.compat import quote
+from urllib.parse import quote
 from auth import get_token
 from config import (
     SITE_HOST,
@@ -10,6 +8,21 @@ from config import (
     LIBRARY_NAME
 )
 from logger import log
+
+
+def _enc(path):
+    """
+    Percent-encode a SharePoint path for use in a Graph URL, preserving
+    the '/' segment separators. SharePoint STORES characters like # + &
+    space in names fine, but they MUST be encoded in the request URL:
+      #  -> %23  (otherwise it's treated as a URL fragment and truncates
+                  the path, causing "Entity only allows writes with a
+                  JSON Content-Type header" on uploads)
+      +  -> %2B  (otherwise decoded as a space)
+      &  -> %26  (otherwise breaks query parsing)
+    safe='/' keeps the path structure intact.
+    """
+    return quote(path or "", safe="/")
 
 
 class SharePoint:
@@ -41,7 +54,7 @@ class SharePoint:
             return True
 
         res = self.session.get(
-             f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{sp_path}",
+             f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{_enc(sp_path)}",
             headers=self.get_headers()
         )
 
@@ -102,96 +115,106 @@ class SharePoint:
             # Re-check inside the lock (another thread may have just made it)
             if path in self.path_cache:
                 return self.path_cache[path]
+
             parts = [p for p in path.split("/") if p]
-            
+
+            # ----------------------------------------------------------
+            # Walk the tree PURELY BY ID. We never put the path in a URL,
+            # so folder names containing #, &, +, %, or any other special
+            # character can never break the request (those chars only
+            # cause trouble when they sit in a URL path; here the name
+            # travels in the JSON body / is matched in memory).
+            #
+            # For each segment:
+            #   - look it up among the parent's children by exact name
+            #   - if missing, create it via items/{parent_id}/children
+            # The drive root is the starting parent.
+            # ----------------------------------------------------------
+
             current = ""
+            parent_id = self._root_id()
             last_item = None
-            for p in parts:
 
-                current = f"{current}/{p}" if current else p
+            for name in parts:
+                current = f"{current}/{name}" if current else name
+
                 if current in self.path_cache:
-                    log(f"✅ Cache HIT : {current}")
                     last_item = self.path_cache[current]
+                    parent_id = last_item["id"]
                     continue
 
-                log(f"❌ Cache MISS : {current}")
+                # Find this child by name under the current parent (by ID)
+                child = self._find_child_by_name(parent_id, name)
 
-                url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{current}"
-                res = self.session.get(
-                    url,
-                    headers=self.get_headers()
-                )
-                
-                if res.status_code == 200:
-                    last_item = res.json()
-                    self.path_cache[current] = last_item
-                    continue
+                if child is None:
+                    # Create it (name in JSON body — never in the URL)
+                    child = self._create_child_folder(parent_id, name)
 
-                if res.status_code == 404:
-                    parent = "/".join(
-                        current.split("/")[:-1]
-                    )
-                    
-                    post_url = (
-                        f"https://graph.microsoft.com/v1.0/drives/"
-                        f"{self.drive_id}/root:/{parent}:/children"
-                    )
-                    parent_item = self.get_item(parent)
-
-                    log(f"Parent Exists : {parent_item is not None}")
-
-                    if parent_item:
-                        log(f"Parent ID : {parent_item['id']}")
-                    else:
-                        log("Parent not found by Graph")
-                    parent_id = parent_item["id"]
-                    log(f"POST : {post_url}")
-                    payload = {
-                        "name": p,
-                        "folder": {},
-                        "@microsoft.graph.conflictBehavior": "replace"
-                    }
-
-                    post_url = (
-                        f"https://graph.microsoft.com/v1.0/drives/"
-                        f"{self.drive_id}/items/{parent_id}/children"
-                    )
-
-                    
-                    create_res = self.session.post(
-                        post_url,
-                        headers={
-                            **self.get_headers(),
-                            "Content-Type": "application/json"
-                        },
-                        json=payload
-                    )
-                    log(f"POST Status : {create_res.status_code}")
-                    log(f"POST Response: {create_res.text}")
-                    if create_res.status_code not in [200, 201]:
-                        log("❌ Folder Creation Failed")
-                        log(f"Current Path : {current}")
-                        log(f"Parent       : {parent}")
-                        log(f"Folder Name  : {p}")
-                        log(f"Status       : {create_res.status_code}")
-                        log(f"Response     : {create_res.text}")
-
-                        raise Exception(
-                            f"Folder create failed: "
-                            f"{create_res.status_code} "
-                            f"{create_res.text}"
-                        )
-
-                    last_item = create_res.json()
-                    self.path_cache[current] = last_item
-                    continue
-
-                raise Exception(
-                    f"Unexpected Graph response "
-                    f"{res.status_code}: {res.text}"
-                )
+                self.path_cache[current] = child
+                last_item = child
+                parent_id = child["id"]
 
             return last_item
+
+    # ---- ID-based helpers (no path ever goes into a URL) ----
+
+    def _root_id(self):
+        """Cached drive-root item id."""
+        if getattr(self, "_cached_root_id", None):
+            return self._cached_root_id
+        res = self.session.get(
+            f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root",
+            headers=self.get_headers()
+        )
+        res.raise_for_status()
+        self._cached_root_id = res.json()["id"]
+        return self._cached_root_id
+
+    def _find_child_by_name(self, parent_id, name):
+        """
+        Return the child item with this exact name under parent_id, or
+        None. Pages through children; matches name case-insensitively
+        (SharePoint folder names are case-insensitive).
+        """
+        url = (
+            f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}"
+            f"/items/{parent_id}/children"
+            f"?$select=id,name,folder,file&$top=200"
+        )
+        target = name.strip().lower()
+        while url:
+            res = self.session.get(url, headers=self.get_headers())
+            if res.status_code != 200:
+                # Can't enumerate — let caller fall through to create
+                return None
+            data = res.json()
+            for item in data.get("value", []):
+                if (item.get("name") or "").strip().lower() == target:
+                    return item
+            url = data.get("@odata.nextLink")
+        return None
+
+    def _create_child_folder(self, parent_id, name):
+        """Create a folder named `name` under parent_id. Name goes in the
+        JSON body, so special characters are always safe."""
+        res = self.session.post(
+            f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}"
+            f"/items/{parent_id}/children",
+            headers={
+                **self.get_headers(),
+                "Content-Type": "application/json"
+            },
+            json={
+                "name": name,
+                "folder": {},
+                "@microsoft.graph.conflictBehavior": "replace"
+            }
+        )
+        if res.status_code not in [200, 201]:
+            raise Exception(
+                f"Folder create failed: {res.status_code} {res.text}"
+            )
+        return res.json()
 
     # =====================================================
     # MAIN UPLOAD ROUTER
@@ -227,6 +250,31 @@ class SharePoint:
     # SIMPLE UPLOAD
     # =====================================================
 
+    def _content_url(self, sp_path):
+        """
+        Build a drive-item content URL for uploading `sp_path`, addressed
+        by the PARENT FOLDER's ID + the (encoded) filename. The parent
+        path — which may contain #, &, +, etc. — never enters the URL, so
+        special characters can't break the request. The parent folder was
+        created+cached by ensure_path before upload, so its id is known.
+        Falls back to the path-addressed URL only if the parent isn't
+        cached (shouldn't happen in normal flow).
+        """
+        sp_path = sp_path.replace("\\", "/")
+        parent_path, _, filename = sp_path.rpartition("/")
+
+        parent = self.path_cache.get(parent_path)
+        if parent and parent.get("id"):
+            return (
+                f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}"
+                f"/items/{parent['id']}:/{_enc(filename)}:/content"
+            )
+        # Fallback: fully-encoded path addressing
+        return (
+            f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}"
+            f"/root:/{_enc(sp_path)}:/content"
+        )
+
     def simple_upload(
         self,
         local_path,
@@ -235,10 +283,7 @@ class SharePoint:
 
         log("\n🚀 SIMPLE FILE UPLOAD")
 
-        url = (
-            f"https://graph.microsoft.com/v1.0/"
-            f"drives/{self.drive_id}/root:/{sp_path}:/content"
-        )
+        url = self._content_url(sp_path)
 
         log("\n☁️ Upload URL:")
         log(url)
@@ -322,12 +367,23 @@ class SharePoint:
 
         # =================================================
         # CREATE SESSION
+        # Address by parent-folder ID + encoded filename (same as simple
+        # upload) so special chars in the folder path can't break the URL.
         # =================================================
 
-        session_url = (
-            f"https://graph.microsoft.com/v1.0/"
-            f"drives/{self.drive_id}/root:/{sp_path}:/createUploadSession"
-        )
+        _p = sp_path.replace("\\", "/")
+        _parent_path, _, _filename = _p.rpartition("/")
+        _parent = self.path_cache.get(_parent_path)
+        if _parent and _parent.get("id"):
+            session_url = (
+                f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}"
+                f"/items/{_parent['id']}:/{_enc(_filename)}:/createUploadSession"
+            )
+        else:
+            session_url = (
+                f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}"
+                f"/root:/{_enc(sp_path)}:/createUploadSession"
+            )
 
         session_res = requests.post(
             session_url,
@@ -566,7 +622,7 @@ class SharePoint:
             return self.path_cache[sp_path]
 
         res = self.session.get(
-            f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{sp_path}",
+            f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{_enc(sp_path)}",
             headers=self.get_headers()
         )
 

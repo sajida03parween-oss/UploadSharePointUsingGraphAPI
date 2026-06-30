@@ -104,7 +104,7 @@ def main(resume=False):
     # ROOT FOLDER
     # ======================================
 
-    base = "Testing_saj"
+    base = "Testing_saj/latest_fix"
 
     sp.ensure_path(base)
 
@@ -235,6 +235,12 @@ def main(resume=False):
 
         for project_node in roots:
             project_root = build_project_tree(project_node, sp, base)
+            # Start this project's log/CSV context BEFORE logging its root,
+            # so the PROJECT row lands in processed_<projectId>.csv (not
+            # processed_unknown_*.csv). Use the project node's own TDMX_ID.
+            proj_tag = (project_node.get("TDMX_ID") or "").strip()
+            if proj_tag:
+                start_project(proj_tag)
             log_processed(
                 project_node,
                 node_type="PROJECT",
