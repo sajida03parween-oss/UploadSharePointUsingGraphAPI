@@ -104,7 +104,7 @@ def main(resume=False):
     # ROOT FOLDER
     # ======================================
 
-    base = "Testing_saj/latest_fix"
+    base = "Testing_saj/latest_fix/[BLPO - PROJETS AF] TOUS PROJETS AIR FRANCE/[PRJ AF TRANSVERSES] PROJETS AIR FRANCE TRANSVERSES"
 
     sp.ensure_path(base)
 
